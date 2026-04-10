@@ -6,6 +6,11 @@ const int SERVO_CHANNEL = 0;       // PWM channel 0
 const int SERVO_FREQ_HZ = 50;      // 50 Hz for servo
 const int SERVO_RES_BITS = 16;     // 16-bit resolution
 
+// ===== MAX7219 7-SEGMENT DISPLAY =====
+const int MAX7219_DIN_PIN = 23;
+const int MAX7219_CLK_PIN = 18;
+const int MAX7219_CS_PIN = 5;
+
 // ===== SENSOR SELECTION =====
 // Uncomment one of the following to select sensor type:
 #define USE_HC_SR04        // HC-SR04 ultrasonic sensor
@@ -39,6 +44,74 @@ void writeServoAngle(int angle)
   ledcWrite(SERVO_CHANNEL, duty);
 }
 
+void max7219Send(byte reg, byte data)
+{
+  digitalWrite(MAX7219_CS_PIN, LOW);
+
+  for (int bit = 7; bit >= 0; bit--) {
+    digitalWrite(MAX7219_CLK_PIN, LOW);
+    digitalWrite(MAX7219_DIN_PIN, (reg >> bit) & 0x01);
+    digitalWrite(MAX7219_CLK_PIN, HIGH);
+  }
+
+  for (int bit = 7; bit >= 0; bit--) {
+    digitalWrite(MAX7219_CLK_PIN, LOW);
+    digitalWrite(MAX7219_DIN_PIN, (data >> bit) & 0x01);
+    digitalWrite(MAX7219_CLK_PIN, HIGH);
+  }
+
+  digitalWrite(MAX7219_CS_PIN, HIGH);
+}
+
+void initDisplay()
+{
+  pinMode(MAX7219_DIN_PIN, OUTPUT);
+  pinMode(MAX7219_CLK_PIN, OUTPUT);
+  pinMode(MAX7219_CS_PIN, OUTPUT);
+
+  digitalWrite(MAX7219_CLK_PIN, HIGH);
+  digitalWrite(MAX7219_CS_PIN, HIGH);
+
+  max7219Send(0x0F, 0x00); // display test off
+  max7219Send(0x09, 0x0F); // decode mode for all digits
+  max7219Send(0x0B, 0x03); // scan digits 0..3
+  max7219Send(0x0A, 0x08); // intensity
+  max7219Send(0x0C, 0x01); // normal operation
+
+  for (int digit = 1; digit <= 4; digit++) {
+    max7219Send(digit, 0x0F); // blank
+  }
+}
+
+void displayDistance(double dist)
+{
+  if (dist < 0) {
+    for (int digit = 1; digit <= 4; digit++) {
+      max7219Send(digit, 0x0A); // dash
+    }
+    return;
+  }
+
+  int distTenth = (int)(dist * 10.0 + 0.5);
+  int whole = distTenth / 10;
+  int tenth = distTenth % 10;
+
+  int digits[4] = {0x0F, 0x0F, 0x0F, 0x0F};
+  digits[0] = tenth | 0x80; // decimal point after tenths digit
+
+  for (int pos = 1; pos <= 3; pos++) {
+    digits[pos] = whole % 10;
+    whole /= 10;
+    if (whole == 0 && pos < 3) {
+      break;
+    }
+  }
+
+  for (int digit = 1; digit <= 4; digit++) {
+    max7219Send(digit, (byte)digits[digit - 1]);
+  }
+}
+
 int potpin = A0;  // Potentiometer connected to A0
 
 int val;          // Variable to store potentiometer value
@@ -59,6 +132,7 @@ double output;  // PD controller output
 void setup()
 {  
   Serial.begin(115200);
+  initDisplay();
   
   // Initialize servo PWM
   if (!initServoPwm()) {
@@ -179,6 +253,7 @@ void loop()
   }
 
   leesSensorEnPot();
+  displayDistance(distance);
 
   output = constrain(PD_regelaar(), -90, 90); // Beperk beweging
 
