@@ -228,12 +228,9 @@ def main() -> int:
             raw_line = ser.readline().decode(errors="ignore")
             fields = parse_line(raw_line)
             if fields is None:
-                if raw_line.strip():
-                    print(f"[ignored] {raw_line.strip()}")
                 continue
             buf.append(fields)
             updated = True
-            print(f"[parsed] dist={fields.get('Dist', 0):.2f} servo={fields.get('Servo', 0):.0f}")
 
         if not buf.time_s:
             return tuple(lines.values())
