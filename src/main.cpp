@@ -127,11 +127,28 @@ double Kp = 10.0;
 double Ki = 0.01;
 double Kd = 2.0;
 double distance;
+double rawDistance;
+double filteredDistance = -1.0;
 double setpoint = 5.0;
 double output;  // PID controller output
 double error;   // Current error for display
 int sensorRaw;
 float voltage;
+bool manualServoOverride = false;
+int manualServoAngle = 90;
+double filteredServoAngle = 90.0;
+double lastPidOutput = 0.0;
+
+const double DISTANCE_FILTER_ALPHA = 0.2;
+const double SERVO_FILTER_ALPHA = 0.25;
+const double SERVO_DEADBAND_DEG = 1.0;
+const double SERVO_RATE_LIMIT_DEG = 3.0;
+
+// Calibrated from user measurements:
+// 5.4 cm printed -> 4.0 cm actual
+// 11.3 cm printed -> 10.0 cm actual
+const double DISTANCE_CAL_SCALE = 1.0169491525;
+const double DISTANCE_CAL_OFFSET = -1.4915254237;
 
 void setup()
 {  
@@ -222,10 +239,18 @@ void leesSensorEnPot()
     voltage = analogReadMilliVolts(dist_sensor) / 1000.0;
 
     if (voltage > 0.10) {
-      distance = 13.0 / voltage;  // rough inverse fit for GP2Y0A41SK0F
+      rawDistance = 13.0 / voltage;  // rough inverse fit for GP2Y0A41SK0F
+      distance = DISTANCE_CAL_SCALE * rawDistance + DISTANCE_CAL_OFFSET;
       distance = constrain(distance, 4.0, 30.0);
+      if (filteredDistance < 0) {
+        filteredDistance = distance;
+      } else {
+        filteredDistance = DISTANCE_FILTER_ALPHA * distance + (1.0 - DISTANCE_FILTER_ALPHA) * filteredDistance;
+      }
     } else {
+      rawDistance = -1.0;
       distance = -1.0;
+      filteredDistance = -1.0;
     }
 
     GP2Y0A41SK0F(distance);
@@ -245,18 +270,23 @@ void leesSensorEnPot()
 double PD_regelaar()
 {
   // Bereken fout
-  error = setpoint - distance;
+  double controlDistance = (filteredDistance >= 0) ? filteredDistance : distance;
+  if (controlDistance < 0) {
+    return lastPidOutput;
+  }
+
+  error = setpoint - controlDistance;
   double derivative = error - prevError;
   integral += error;  // Accumulate error for integral term
   
   // Limit integral windup
   integral = constrain(integral, -1000, 1000);
-  Ki = 0;
+  // Ki = 0;
   prevError = error;
 
   // PID uitgang
-  double output = Kp * error + Ki * integral + Kd * derivative;
-  return output;
+  lastPidOutput = Kp * error + Ki * integral + Kd * derivative;
+  return lastPidOutput;
 }
 
 void handleSerialCommand()
@@ -266,6 +296,15 @@ void handleSerialCommand()
     cmd.trim();
     Serial.printf("serial input: %s", cmd);
     if (cmd.length() == 0) return;
+
+    String cmdLower = cmd;
+    cmdLower.toLowerCase();
+
+    if (cmdLower == "auto") {
+      manualServoOverride = false;
+      Serial.println("Servo mode: AUTO");
+      return;
+    }
     
     // Parse command format: "set:value" or "setpoint:value"
     int colonIdx = cmd.indexOf(':');
@@ -274,6 +313,8 @@ void handleSerialCommand()
       String valueStr = cmd.substring(colonIdx + 1);
       
       param.toLowerCase();
+      String valueLower = valueStr;
+      valueLower.toLowerCase();
       
       if (param == "set" || param == "setpoint") {
         double newSetpoint = valueStr.toFloat();
@@ -300,6 +341,20 @@ void handleSerialCommand()
         prevError = 0;
         Serial.println("PID state reset");
       }
+      else if (param == "angle" || param == "servo") {
+        manualServoAngle = constrain((int)round(valueStr.toFloat()), 0, 180);
+        manualServoOverride = true;
+        Serial.printf("Servo mode: MANUAL | Angle: %d\n", manualServoAngle);
+      }
+      else if (param == "manual") {
+        if (valueLower == "1" || valueLower == "on") {
+          manualServoOverride = true;
+          Serial.printf("Servo mode: MANUAL | Angle: %d\n", manualServoAngle);
+        } else if (valueLower == "0" || valueLower == "off") {
+          manualServoOverride = false;
+          Serial.println("Servo mode: AUTO");
+        }
+      }
     }
   }
 }
@@ -316,14 +371,28 @@ void loop()
   output = constrain(PD_regelaar(), -90, 90); // Beperk beweging
 
   // Zet om naar servo positie (0-180 graden)
-  int servoAngle = map(output, -90, 90, -90, 90);
+  double autoServoAngle = 90.0 - output;
+  autoServoAngle = constrain(autoServoAngle, 0.0, 180.0);
+
+  if (!manualServoOverride) {
+    double delta = autoServoAngle - filteredServoAngle;
+    delta = constrain(delta, -SERVO_RATE_LIMIT_DEG, SERVO_RATE_LIMIT_DEG);
+    filteredServoAngle += delta;
+    if (fabs(filteredServoAngle - autoServoAngle) < SERVO_DEADBAND_DEG) {
+      filteredServoAngle = autoServoAngle;
+    }
+  } else {
+    filteredServoAngle = manualServoAngle;
+  }
+
+  int servoAngle = (int)round(filteredServoAngle);
 
   if (currentMillis - previousMillis >= interval_write_servo) {
     previousMillis = currentMillis;
     writeServoAngle(servoAngle);
     
-    // Print all PID variables in one line
-    Serial.printf("Set:%.2f | Raw:%d | Volt:%.2f | Dist:%.1f | Err:%.1f | Int:%.1f | Out:%.1f | Kp:%.2f | Ki:%.2f | Kd:%.2f | Angle:%d\n",
-                  setpoint, sensorRaw, voltage, distance, error, integral, output, Kp, Ki, Kd, servoAngle);
+    // Plot-friendly line: values stay numeric and label each signal.
+    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Int:%.2f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.2f,Kd:%.2f\n",
+                  manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, integral, output, filteredServoAngle, Kp, Ki, Kd);
   }
 }
