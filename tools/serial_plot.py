@@ -186,7 +186,7 @@ def main() -> int:
 
         sliders["setpoint"] = Slider(slider_axes["setpoint"], "Set", 0.0, 30.0, valinit=5.0, valstep=0.1)
         sliders["kp"] = Slider(slider_axes["kp"], "Kp", 0.0, 50.0, valinit=10.0, valstep=0.1)
-        sliders["ki"] = Slider(slider_axes["ki"], "Ki", 0.0, 5.0, valinit=0.01, valstep=0.01)
+        sliders["ki"] = Slider(slider_axes["ki"], "Ki", 0.0, 5.0, valinit=0.010, valstep=0.001, valfmt="%1.3f")
         sliders["kd"] = Slider(slider_axes["kd"], "Kd", 0.0, 20.0, valinit=2.0, valstep=0.1)
         sliders["servo"] = Slider(slider_axes["servo"], "Angle", 0.0, 180.0, valinit=90.0, valstep=1.0)
 
