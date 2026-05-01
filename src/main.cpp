@@ -13,14 +13,14 @@ const int MAX7219_CS_PIN = 5;
 
 // ===== SENSOR SELECTION =====
 // Uncomment one of the following to select sensor type:
-#define USE_HC_SR04        // HC-SR04 ultrasonic sensor
-// #define USE_ANALOG_SENSOR  // Original analog distance sensor on GPIO A1
+// #define USE_HC_SR04        // HC-SR04 ultrasonic sensor
+#define USE_ANALOG_SENSOR  // Original analog distance sensor on GPIO A1
 
 #ifdef USE_HC_SR04
   const int TRIG_PIN = 25;   // GPIO 25 for HC-SR04 trigger
   const int ECHO_PIN = 33;   // GPIO 33 for HC-SR04 echo
 #else
-  #define dist_sensor A1    // Analog sensor on A1
+  #define dist_sensor 34    // Analog sensor on A1
 #endif
 
 bool initServoPwm()
@@ -83,7 +83,7 @@ void initDisplay()
   }
 }
 
-void displayDistance(double dist)
+void GP2Y0A41SK0F(double dist)
 {
   if (dist < 0) {
     for (int digit = 1; digit <= 4; digit++) {
@@ -122,17 +122,25 @@ const long interval_write_servo = 15;  // Update every 15ms instead of delay(15)
   unsigned long lastRangeReadMs = 0;
 #endif
 double prevError = 0;
-double Kp = 10;
-double Kd = 2;
+double integral = 0;  // Accumulated error for integral term
+double Kp = 10.0;
+double Ki = 0.01;
+double Kd = 2.0;
 double distance;
-int setpoint;
-double output;  // PD controller output
-
+double setpoint = 5.0;
+double output;  // PID controller output
+double error;   // Current error for display
+int sensorRaw;
+float voltage;
 
 void setup()
 {  
   Serial.begin(115200);
   initDisplay();
+
+#ifdef USE_ANALOG_SENSOR
+  analogSetPinAttenuation(dist_sensor, ADC_11db);
+#endif
   
   // Initialize servo PWM
   if (!initServoPwm()) {
@@ -210,14 +218,21 @@ void leesSensorEnPot()
     }
   #else
     // Original analog sensor
-    int sensorValue = analogRead(dist_sensor);
-    float voltage = sensorValue * (5.0 / 1023.0);
-    distance = 2076.0 / (sensorValue - 11.0);
+    sensorRaw = analogRead(dist_sensor);
+    voltage = analogReadMilliVolts(dist_sensor) / 1000.0;
 
+    if (voltage > 0.10) {
+      distance = 13.0 / voltage;  // rough inverse fit for GP2Y0A41SK0F
+      distance = constrain(distance, 4.0, 30.0);
+    } else {
+      distance = -1.0;
+    }
+
+    GP2Y0A41SK0F(distance);
     if (distance <= 30) {
-      Serial.print("Distance: ");
-      Serial.print(distance);
-      Serial.println(" cm");
+      // Serial.print("Distance: ");
+      // Serial.print(distance);
+      // Serial.println(" cm");
     } else {
       Serial.println("Out of range");
     }
@@ -225,49 +240,90 @@ void leesSensorEnPot()
   
   // setpoint = analogRead(potpin);
   // setpoint = map(setpoint, 0, 1023, 4, 30);
-  setpoint = 5;
 }
 
 double PD_regelaar()
 {
   // Bereken fout
-  double error = setpoint - distance;
+  error = setpoint - distance;
   double derivative = error - prevError;
+  integral += error;  // Accumulate error for integral term
+  
+  // Limit integral windup
+  integral = constrain(integral, -1000, 1000);
+  Ki = 0;
   prevError = error;
 
-  // PD uitgang
-  double output = Kp * error + Kd * derivative;
+  // PID uitgang
+  double output = Kp * error + Ki * integral + Kd * derivative;
   return output;
+}
+
+void handleSerialCommand()
+{
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    Serial.printf("serial input: %s", cmd);
+    if (cmd.length() == 0) return;
+    
+    // Parse command format: "set:value" or "setpoint:value"
+    int colonIdx = cmd.indexOf(':');
+    if (colonIdx > 0) {
+      String param = cmd.substring(0, colonIdx);
+      String valueStr = cmd.substring(colonIdx + 1);
+      
+      param.toLowerCase();
+      
+      if (param == "set" || param == "setpoint") {
+        double newSetpoint = valueStr.toFloat();
+        setpoint = newSetpoint;
+        Serial.printf("Setpoint updated to: %.2f\n", setpoint);
+      } 
+      else if (param == "kp") {
+        double newKp = valueStr.toFloat();
+        Kp = newKp;
+        Serial.printf("Kp updated to: %.2f\n", Kp);
+      }
+      else if (param == "kd") {
+        double newKd = valueStr.toFloat();
+        Kd = newKd;
+        Serial.printf("Kd updated to: %.2f\n", Kd);
+      }
+      else if (param == "ki") {
+        double newKi = valueStr.toFloat();
+        Ki = newKi;
+        Serial.printf("Ki updated to: %.2f\n", Ki);
+      }
+      else if (param == "reset") {
+        integral = 0;
+        prevError = 0;
+        Serial.println("PID state reset");
+      }
+    }
+  }
 }
 
 void loop()
 {
   unsigned long currentMillis = millis();
 
-  if (Serial.available())
-  {
-      char buf[30];
-      int readCnt = Serial.readBytes(buf, 30);
-      buf[readCnt] = '\0';
-      Serial.printf("String = %s\n", buf);
-  }
+  handleSerialCommand();
 
   leesSensorEnPot();
-  displayDistance(distance);
+  // displayDistance(distance);
 
   output = constrain(PD_regelaar(), -90, 90); // Beperk beweging
 
   // Zet om naar servo positie (0-180 graden)
-  int servoAngle = map(output, -90, 90, 0, 180);
+  int servoAngle = map(output, -90, 90, -90, 90);
 
   if (currentMillis - previousMillis >= interval_write_servo) {
     previousMillis = currentMillis;
     writeServoAngle(servoAngle);
+    
+    // Print all PID variables in one line
+    Serial.printf("Set:%.2f | Raw:%d | Volt:%.2f | Dist:%.1f | Err:%.1f | Int:%.1f | Out:%.1f | Kp:%.2f | Ki:%.2f | Kd:%.2f | Angle:%d\n",
+                  setpoint, sensorRaw, voltage, distance, error, integral, output, Kp, Ki, Kd, servoAngle);
   }
-
-  // Debug
-  Serial.print("output: "); Serial.print(output);
-  Serial.print(" | Setpoint: "); Serial.print(setpoint);
-  Serial.print(" | Distance: "); Serial.print(distance);
-  Serial.print(" | Angle: "); Serial.println(servoAngle);
 }
