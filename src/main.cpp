@@ -64,6 +64,11 @@ double desiredAccelerationMPS2 = 0.0;      // Intermediate: desired ball acceler
 double ballVelocityMPS = 0.0;              // Estimated ball velocity (m/s)
 double ballPositionM = 0.0;                // Ball position in meters (from sensor in cm)
 
+const double SERVO_NEUTRAL_DEG = 84.0;
+const double SERVO_TRAVEL_LIMIT_DEG = 30.0;
+const double SERVO_MIN_DEG = SERVO_NEUTRAL_DEG - SERVO_TRAVEL_LIMIT_DEG;
+const double SERVO_MAX_DEG = SERVO_NEUTRAL_DEG + SERVO_TRAVEL_LIMIT_DEG;
+
 bool initServoPwm()
 {
   double actualFreq = ledcSetup(SERVO_CHANNEL, SERVO_FREQ_HZ, SERVO_RES_BITS);
@@ -190,8 +195,8 @@ double error;   // Current error for display
 int sensorRaw;
 float voltage;
 bool manualServoOverride = false;
-int manualServoAngle = 90;
-double filteredServoAngle = 90.0;
+int manualServoAngle = 84;
+double filteredServoAngle = SERVO_NEUTRAL_DEG;
 double lastPidOutput = 0.0;
 double prevControlDistance = -1.0;
 double filteredDerivative = 0.0;
@@ -220,11 +225,11 @@ const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger t
 const double PID_DERIVATIVE_ALPHA = 0.85;
 const double PID_OUTPUT_ALPHA = 0.35;
 
-const double PID_ERROR_DEADBAND_CM = 0.10;
+const double PID_ERROR_DEADBAND_CM = 0.20;
 
-const double SERVO_FILTER_ALPHA = 0.25;
+const double SERVO_FILTER_ALPHA = 0.12;
 const double SERVO_DEADBAND_DEG = 1.0;
-const double SERVO_RATE_LIMIT_DEG = 3.0;
+const double SERVO_RATE_LIMIT_DEG = 0.5;
 // Calibrated from user measurements:
 // 5.4 cm printed -> 4.0 cm actual
 // 11.3 cm printed -> 10.0 cm actual
@@ -254,7 +259,7 @@ void setup()
   if (!initServoPwm()) {
     Serial.println("ERROR: Failed to initialize servo PWM!");
   }
-  writeServoAngle(90);  // Center servo
+  writeServoAngle(84);  // Beam neutral servo position
   
   #ifdef USE_HC_SR04
     pinMode(TRIG_PIN, OUTPUT);
@@ -466,10 +471,16 @@ double PD_regelaar()
   // Kp maps position error (cm) to acceleration. Convert error to meters first.
   double errorM = error / 100.0;  // Convert cm to m
   double rawOutput = Kp * errorM + Ki * integral + Kd * filteredDerivative;
+
+  // Reduce the big snap when crossing the setpoint: soften output around zero error.
+  if (fabs(error) < 0.35) {
+    rawOutput *= 0.35;
+  }
+
   lastPidOutput = PID_OUTPUT_ALPHA * lastPidOutput + (1.0 - PID_OUTPUT_ALPHA) * rawOutput;
   
   // Limit acceleration command (±2 m/s² reasonable for 5.5g ball)
-  return constrain(lastPidOutput, -2.0, 2.0);  // m/s²
+  return constrain(lastPidOutput, -1.0, 1.0);  // m/s²
 }
 
 void handleSerialCommand()
@@ -568,11 +579,11 @@ void loop()
   desiredBeamAngleDeg = desiredBeamAngleRad * (180.0 / M_PI);  // Convert to degrees
 
   // Step 3: Convert beam angle to servo angle using lever kinematics
-  // Servo at 90° neutral; positive servo angle → positive beam tilt
-  // theta_servo = 90 + (alpha_beam / gain)
+  // Servo neutral is calibrated at 84°; positive beam tilt maps above neutral
+  // theta_servo = neutral + (alpha_beam / gain)
   double servoAngleFromBeam = desiredBeamAngleDeg / LEVER_TO_BEAM_GAIN;
-  double autoServoAngle = 90.0 + servoAngleFromBeam;
-  autoServoAngle = constrain(autoServoAngle, 0.0, 180.0);
+  double autoServoAngle = SERVO_NEUTRAL_DEG + servoAngleFromBeam;
+  autoServoAngle = constrain(autoServoAngle, SERVO_MIN_DEG, SERVO_MAX_DEG);
 
   if (!manualServoOverride) {
     double prevFiltered = filteredServoAngle;
@@ -589,7 +600,7 @@ void loop()
       filteredServoAngle = autoServoAngle;
     }
   } else {
-    filteredServoAngle = manualServoAngle;
+    filteredServoAngle = constrain((double)manualServoAngle, SERVO_MIN_DEG, SERVO_MAX_DEG);
   }
 
   loopCounter++;
