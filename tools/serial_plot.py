@@ -233,7 +233,7 @@ def main() -> int:
             ("servo", "Angle", 54.0, 114.0, 84.0, 1.0, "%.0f", "angle"),
             ("neutral", "Neutral", 0.0, 180.0, 84.0, 1.0, "%.0f", "neutral"),
             ("travel", "Travel", 1.0, 60.0, 30.0, 1.0, "%.0f", "travel"),
-            ("dir", "Dir", -1.0, 1.0, 1.0, 2.0, "%.0f", "dir"),
+            ("dir", "Dir", -1.0, 1.0, -1.0, 2.0, "%.0f", "dir"),
             ("piddead", "PidDead", 0.0, 2.0, 0.20, 0.01, "%.2f", "piddead"),
             ("settleerr", "SetErr", 0.0, 2.0, 0.6, 0.01, "%.2f", "settleerr"),
             ("settlederiv", "SetDer", 0.0, 0.50, 0.08, 0.001, "%.3f", "settlederiv"),

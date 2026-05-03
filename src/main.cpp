@@ -66,7 +66,7 @@ double ballPositionM = 0.0;                // Ball position in meters (from sens
 
 double SERVO_NEUTRAL_DEG = 84.0;
 double SERVO_TRAVEL_LIMIT_DEG = 30.0;
-double CONTROL_DIRECTION = 1.0;  // Flip this if the ball moves the wrong way
+double CONTROL_DIRECTION = -1.0;  // Flip this if the ball moves the wrong way
 
 double servoMinDeg()
 {
