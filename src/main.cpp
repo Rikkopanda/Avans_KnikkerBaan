@@ -32,8 +32,9 @@ const int MAX7219_CS_PIN = 5;
 // ===== SYSTEM PARAMETERS (Knikkerban Ball-on-Beam) =====
 // Physical system constants from theoretical model (Lagrangian dynamics)
 const double BALL_MASS_KG = 0.0055;         // kg (mass)
-const double BALL_RADIUS_MM = 15.0;         // mm (radius for rolling constraint)
-const double BALL_RADIUS_M = BALL_RADIUS_MM / 1000.0;  // m
+const double BALL_DIAMETER_MM = 15.0;       // mm (ball diameter, from physical measurement)
+const double BALL_RADIUS_MM = BALL_DIAMETER_MM / 2.0;  // mm (radius = 7.5mm)
+const double BALL_RADIUS_M = BALL_RADIUS_MM / 1000.0;  // m (= 0.0075 m)
 const double BEAM_L_FRONT_CM = 14.0;        // Distance from pivot to ball (front), cm
 const double BEAM_L_BACK_CM = 8.5;          // Distance from pivot to ball (back), cm
 const double LEVER_OFFSET_MM = 16.0;        // Lever arm offset, mm
@@ -197,13 +198,13 @@ double integral = 0;  // Accumulated error integral in meter*seconds
 // - If ball oscillates: increase Kd or reduce Kp
 // - If response is sluggish: increase Kp or Ki
 // - Physics naturally filters: gravity provides restoring force on tilted beam
-double Kp = 10.0;   // (m/s²) per meter of position error
-double Ki = 0.01;
-double Kd = 2.0;
+double Kp = 8.0;    // (m/s²) per meter of position error — reduced to avoid overshoot
+double Ki = 0.005;  // Small integral, avoid windup
+double Kd = 4.0;    // Strong derivative to damp oscillation
 double distance;
 double rawDistance;
 double filteredDistance = -1.0;
-double setpoint = 5.0;
+double setpoint = 10.0;  // cm from sensor to ball CENTER (mid-beam is a good starting point)
 double output;  // PID controller output
 double error;   // Current error for display
 int sensorRaw;
@@ -241,11 +242,11 @@ double PID_OUTPUT_ALPHA = 0.35;
 
 double PID_ERROR_DEADBAND_CM = 0.20;
 
-double SERVO_FILTER_ALPHA = 0.08;
-double SERVO_DEADBAND_DEG = 1.5;
-double SERVO_RATE_LIMIT_DEG = 0.35;
-double SETTLE_ERROR_DEADBAND_CM = 0.6;
-double SETTLE_DERIVATIVE_DEADBAND = 0.08;
+double SERVO_FILTER_ALPHA = 0.15;   // Slightly more responsive filter
+double SERVO_DEADBAND_DEG = 0.8;    // Tighter deadband for more precise control
+double SERVO_RATE_LIMIT_DEG = 0.8;  // Faster rate limit so servo can respond to fast ball movement
+double SETTLE_ERROR_DEADBAND_CM = 0.8;    // Ball is considered "at setpoint" within this range
+double SETTLE_DERIVATIVE_DEADBAND = 0.05; // Ball is considered "stopped" below this speed
 const int SERVO_WRITE_MIN_STEP_DEG = 1;
 // Calibrated from user measurements:
 // 5.4 cm printed -> 4.0 cm actual
@@ -404,6 +405,12 @@ void leesSensorEnPot()
 
       distance = DISTANCE_CAL_SCALE * rawDistance + DISTANCE_CAL_OFFSET;
 
+      // *** BALL CENTER CORRECTION ***
+      // The IR sensor measures distance to the FRONT (nearest surface) of the ball.
+      // The ball center is further away by one ball radius (7.5mm = 0.75cm).
+      // All setpoints and control logic now refer to ball CENTER position.
+      distance += BALL_RADIUS_MM / 10.0;  // convert mm to cm and add
+
       distance = constrain(distance, 4.0, 30.0);
 
       // Update simple moving average buffer
@@ -507,10 +514,9 @@ double PD_regelaar()
     integral *= 0.85;
   }
 
-  // Reduce the big snap when crossing the setpoint: soften output around zero error.
-  if (fabs(error) < 0.35) {
-    rawOutput *= 0.35;
-  }
+  // NOTE: The output-softening block near zero error was removed.
+  // Multiplying rawOutput by 0.35 near the setpoint was suppressing the
+  // derivative term right where damping matters most, causing oscillation.
 
   lastPidOutput = PID_OUTPUT_ALPHA * lastPidOutput + (1.0 - PID_OUTPUT_ALPHA) * rawOutput;
   
@@ -664,7 +670,7 @@ void loop()
   // Servo neutral is calibrated at 84°; positive beam tilt maps above or below neutral
   // theta_servo = neutral + (alpha_beam / gain)
   double servoAngleFromBeam = desiredBeamAngleDeg / LEVER_TO_BEAM_GAIN;
-  double autoServoAngle = SERVO_NEUTRAL_DEG + servoAngleFromBeam;
+  double autoServoAngle = SERVO_NEUTRAL_DEG - servoAngleFromBeam;
   autoServoAngle = constrain(autoServoAngle, servoMinDeg(), servoMaxDeg());
 
   if (!manualServoOverride) {
