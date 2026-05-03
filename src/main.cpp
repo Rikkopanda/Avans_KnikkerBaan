@@ -64,10 +64,24 @@ double desiredAccelerationMPS2 = 0.0;      // Intermediate: desired ball acceler
 double ballVelocityMPS = 0.0;              // Estimated ball velocity (m/s)
 double ballPositionM = 0.0;                // Ball position in meters (from sensor in cm)
 
-const double SERVO_NEUTRAL_DEG = 84.0;
-const double SERVO_TRAVEL_LIMIT_DEG = 30.0;
-const double SERVO_MIN_DEG = SERVO_NEUTRAL_DEG - SERVO_TRAVEL_LIMIT_DEG;
-const double SERVO_MAX_DEG = SERVO_NEUTRAL_DEG + SERVO_TRAVEL_LIMIT_DEG;
+double SERVO_NEUTRAL_DEG = 84.0;
+double SERVO_TRAVEL_LIMIT_DEG = 30.0;
+double CONTROL_DIRECTION = 1.0;  // Flip this if the ball moves the wrong way
+
+double servoMinDeg()
+{
+  return SERVO_NEUTRAL_DEG - SERVO_TRAVEL_LIMIT_DEG;
+}
+
+double servoMaxDeg()
+{
+  return SERVO_NEUTRAL_DEG + SERVO_TRAVEL_LIMIT_DEG;
+}
+
+double maxBeamTiltDeg()
+{
+  return SERVO_TRAVEL_LIMIT_DEG * LEVER_TO_BEAM_GAIN;
+}
 
 bool initServoPwm()
 {
@@ -162,13 +176,13 @@ int potpin = A0;  // Potentiometer connected to A0
 
 int val;          // Variable to store potentiometer value
 unsigned long previousMillis = 0;
-const long interval_write_servo = 20;  // Update every 20ms (50Hz) to reduce servo jitter
+const long interval_write_servo = 30;  // Update every 30ms to reduce servo chatter
 #ifdef USE_HC_SR04
   const long RANGE_READ_INTERVAL_MS = 65; // HC-SR04 needs ~60ms between measurements
   unsigned long lastRangeReadMs = 0;
 #endif
 double prevError = 0;
-double integral = 0;  // Accumulated error for integral term
+double integral = 0;  // Accumulated error integral in meter*seconds
 
 // ===== PID TUNING NOTES =====
 // System: lightweight ball (5.5g) rolling on tilted beam via servo-driven lever
@@ -222,14 +236,17 @@ double maSum = 0.0;
 double lastValidDistance = -1.0;
 const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger than this
 
-const double PID_DERIVATIVE_ALPHA = 0.85;
-const double PID_OUTPUT_ALPHA = 0.35;
+double PID_DERIVATIVE_ALPHA = 0.85;
+double PID_OUTPUT_ALPHA = 0.35;
 
-const double PID_ERROR_DEADBAND_CM = 0.20;
+double PID_ERROR_DEADBAND_CM = 0.20;
 
-const double SERVO_FILTER_ALPHA = 0.12;
-const double SERVO_DEADBAND_DEG = 1.0;
-const double SERVO_RATE_LIMIT_DEG = 0.5;
+double SERVO_FILTER_ALPHA = 0.08;
+double SERVO_DEADBAND_DEG = 1.5;
+double SERVO_RATE_LIMIT_DEG = 0.35;
+double SETTLE_ERROR_DEADBAND_CM = 0.6;
+double SETTLE_DERIVATIVE_DEADBAND = 0.08;
+const int SERVO_WRITE_MIN_STEP_DEG = 1;
 // Calibrated from user measurements:
 // 5.4 cm printed -> 4.0 cm actual
 // 11.3 cm printed -> 10.0 cm actual
@@ -245,6 +262,7 @@ unsigned long savedAdcCount = 0;
 unsigned long savedControlCount = 0;
 unsigned long telemetryIntervalMs = 50;
 unsigned long lastTelemetryMs = 0;
+int lastWrittenServoAngle = (int)SERVO_NEUTRAL_DEG;
 
 void setup()
 {  
@@ -259,7 +277,7 @@ void setup()
   if (!initServoPwm()) {
     Serial.println("ERROR: Failed to initialize servo PWM!");
   }
-  writeServoAngle(84);  // Beam neutral servo position
+  writeServoAngle((int)round(SERVO_NEUTRAL_DEG));  // Beam neutral servo position
   
   #ifdef USE_HC_SR04
     pinMode(TRIG_PIN, OUTPUT);
@@ -449,28 +467,45 @@ double PD_regelaar()
     prevControlDistance = controlDistance;
   }
 
+  static unsigned long lastControlUs = 0;
+  unsigned long nowUs = micros();
+  double dt = 0.015;
+  if (lastControlUs != 0) {
+    dt = (double)(nowUs - lastControlUs) / 1000000.0;
+    dt = constrain(dt, 0.005, 0.05);
+  }
+  lastControlUs = nowUs;
+
   // Position error (cm)
   error = setpoint - controlDistance;
   if (fabs(error) < PID_ERROR_DEADBAND_CM) {
     error = 0.0;
   }
 
+  // Convert cm -> m once and keep PID terms in compatible units.
+  double errorM = error / 100.0;
+
   // Differentiate the measured distance (not error) to avoid setpoint kick
   double measurementDelta = controlDistance - prevControlDistance;
   prevControlDistance = controlDistance;
 
-  const double dt = 0.015;
   double derivative = -measurementDelta / dt;
   filteredDerivative = PID_DERIVATIVE_ALPHA * filteredDerivative + (1.0 - PID_DERIVATIVE_ALPHA) * derivative;
 
-  integral += error;
-  integral = constrain(integral, -1000, 1000);
+  integral += errorM * dt;
+  integral = constrain(integral, -0.5, 0.5);
   prevError = error;
 
   // PID output: desired ball acceleration (m/s²)
-  // Kp maps position error (cm) to acceleration. Convert error to meters first.
-  double errorM = error / 100.0;  // Convert cm to m
-  double rawOutput = Kp * errorM + Ki * integral + Kd * filteredDerivative;
+  // Derivative is measured in cm/s; convert to m/s for consistent units.
+  double derivativeM = filteredDerivative / 100.0;
+  double rawOutput = Kp * errorM + Ki * integral + Kd * derivativeM;
+
+  // When the ball is close and slow, stop pushing harder. This prevents hunting.
+  if (fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND) {
+    rawOutput = 0.0;
+    integral *= 0.85;
+  }
 
   // Reduce the big snap when crossing the setpoint: soften output around zero error.
   if (fabs(error) < 0.35) {
@@ -539,10 +574,54 @@ void handleSerialCommand()
         Serial.println("PID state reset");
       }
       else if (param == "angle" || param == "servo") {
-        manualServoAngle = constrain((int)round(valueStr.toFloat()), 0, 180);
+        manualServoAngle = constrain((int)round(valueStr.toFloat()), (int)round(servoMinDeg()), (int)round(servoMaxDeg()));
         manualServoOverride = true;
         Serial.printf("Servo mode: MANUAL | Angle: %d\n", manualServoAngle);
       }
+        else if (param == "neutral") {
+          SERVO_NEUTRAL_DEG = valueStr.toFloat();
+          Serial.printf("Servo neutral updated to: %.1f\n", SERVO_NEUTRAL_DEG);
+        }
+        else if (param == "travel") {
+          SERVO_TRAVEL_LIMIT_DEG = fmax(1.0, (double)valueStr.toFloat());
+          Serial.printf("Servo travel updated to: %.1f\n", SERVO_TRAVEL_LIMIT_DEG);
+        }
+        else if (param == "dir") {
+          CONTROL_DIRECTION = (valueStr.toFloat() >= 0.0) ? 1.0 : -1.0;
+          Serial.printf("Control direction updated to: %.1f\n", CONTROL_DIRECTION);
+        }
+        else if (param == "servofilter") {
+          SERVO_FILTER_ALPHA = constrain(valueStr.toFloat(), 0.0f, 1.0f);
+          Serial.printf("Servo filter alpha updated to: %.3f\n", SERVO_FILTER_ALPHA);
+        }
+        else if (param == "servorate") {
+          SERVO_RATE_LIMIT_DEG = fmax(0.05, (double)valueStr.toFloat());
+          Serial.printf("Servo rate limit updated to: %.2f\n", SERVO_RATE_LIMIT_DEG);
+        }
+        else if (param == "servodead") {
+          SERVO_DEADBAND_DEG = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("Servo deadband updated to: %.2f\n", SERVO_DEADBAND_DEG);
+        }
+        else if (param == "piddead") {
+          PID_ERROR_DEADBAND_CM = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("PID deadband updated to: %.2f\n", PID_ERROR_DEADBAND_CM);
+        }
+        else if (param == "settleerr") {
+          SETTLE_ERROR_DEADBAND_CM = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("Settle error deadband updated to: %.2f\n", SETTLE_ERROR_DEADBAND_CM);
+        }
+        else if (param == "settlederiv") {
+          SETTLE_DERIVATIVE_DEADBAND = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("Settle derivative deadband updated to: %.3f\n", SETTLE_DERIVATIVE_DEADBAND);
+        }
+        else if (param == "pidoutalpha") {
+          PID_OUTPUT_ALPHA = constrain(valueStr.toFloat(), 0.0f, 1.0f);
+          Serial.printf("PID output alpha updated to: %.3f\n", PID_OUTPUT_ALPHA);
+        }
+        else if (param == "derivalpha") {
+          PID_DERIVATIVE_ALPHA = constrain(valueStr.toFloat(), 0.0f, 1.0f);
+          Serial.printf("PID derivative alpha updated to: %.3f\n", PID_DERIVATIVE_ALPHA);
+        }
       else if (param == "manual") {
         if (valueLower == "1" || valueLower == "on") {
           manualServoOverride = true;
@@ -572,18 +651,21 @@ void loop()
   // Step 2: Convert acceleration to beam angle using rolling dynamics
   // a = g * sin(alpha) / I_factor
   // => alpha = arcsin(a * I_factor / g)
-  // Clamp to reasonable beam angles (±30°)
+  // Clamp to the beam range the servo can actually produce (about ±3.4°)
   double accelRatio = desiredAccelerationMPS2 * INERTIA_FACTOR / GRAVITY_M_S2;
   accelRatio = constrain(accelRatio, -1.0, 1.0);  // sin is bounded [-1, 1]
   desiredBeamAngleRad = asin(accelRatio);
   desiredBeamAngleDeg = desiredBeamAngleRad * (180.0 / M_PI);  // Convert to degrees
+  desiredBeamAngleDeg = CONTROL_DIRECTION * desiredBeamAngleDeg;
+  desiredBeamAngleDeg = constrain(desiredBeamAngleDeg, -maxBeamTiltDeg(), maxBeamTiltDeg());
+  output = desiredBeamAngleDeg;
 
   // Step 3: Convert beam angle to servo angle using lever kinematics
-  // Servo neutral is calibrated at 84°; positive beam tilt maps above neutral
+  // Servo neutral is calibrated at 84°; positive beam tilt maps above or below neutral
   // theta_servo = neutral + (alpha_beam / gain)
   double servoAngleFromBeam = desiredBeamAngleDeg / LEVER_TO_BEAM_GAIN;
   double autoServoAngle = SERVO_NEUTRAL_DEG + servoAngleFromBeam;
-  autoServoAngle = constrain(autoServoAngle, SERVO_MIN_DEG, SERVO_MAX_DEG);
+  autoServoAngle = constrain(autoServoAngle, servoMinDeg(), servoMaxDeg());
 
   if (!manualServoOverride) {
     double prevFiltered = filteredServoAngle;
@@ -600,8 +682,13 @@ void loop()
       filteredServoAngle = autoServoAngle;
     }
   } else {
-    filteredServoAngle = constrain((double)manualServoAngle, SERVO_MIN_DEG, SERVO_MAX_DEG);
+    filteredServoAngle = constrain((double)manualServoAngle, servoMinDeg(), servoMaxDeg());
   }
+
+  // // Hold the servo steady if the command is essentially unchanged.
+  // if (fabs(filteredServoAngle - lastWrittenServoAngle) < SERVO_WRITE_MIN_STEP_DEG) {
+  //   filteredServoAngle = lastWrittenServoAngle;
+  // }
 
   loopCounter++;
     // Serial.printf("millis() - loopTimer:%lu\n\n", millis() - loopTimer);
@@ -621,16 +708,19 @@ void loop()
   int servoAngle = (int)round(filteredServoAngle);
   
   if (currentMillis - previousMillis >= interval_write_servo) {
-    controlCount++;
-    previousMillis = currentMillis;
-    writeServoAngle(servoAngle);
+    if (abs(servoAngle - lastWrittenServoAngle) >= SERVO_WRITE_MIN_STEP_DEG) {
+      controlCount++;
+      previousMillis = currentMillis;
+      lastWrittenServoAngle = servoAngle;
+      writeServoAngle(servoAngle);
+    }
   }
 
   if (currentMillis - lastTelemetryMs >= telemetryIntervalMs) {
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
-    // Accel = desired acceleration (m/s²), BeamCmd = beam angle from dynamics, Servo = servo PWM angle
-    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,Beam:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f\n",
-                  manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2, desiredBeamAngleDeg, filteredServoAngle, Kp, Ki, Kd);
+    // Out = beam command in degrees, Servo = actual servo angle in degrees
+    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,ServoDead:%.2f\n",
+                    manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, SERVO_DEADBAND_DEG);
   }
 }

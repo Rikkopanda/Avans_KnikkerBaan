@@ -41,6 +41,15 @@ class TelemetryBuffer:
         self.kp = collections.deque(maxlen=max_points)
         self.ki = collections.deque(maxlen=max_points)
         self.kd = collections.deque(maxlen=max_points)
+        self.neutral = collections.deque(maxlen=max_points)
+        self.travel = collections.deque(maxlen=max_points)
+        self.direction = collections.deque(maxlen=max_points)
+        self.pid_dead = collections.deque(maxlen=max_points)
+        self.settle_err = collections.deque(maxlen=max_points)
+        self.settle_deriv = collections.deque(maxlen=max_points)
+        self.servo_filt = collections.deque(maxlen=max_points)
+        self.servo_rate = collections.deque(maxlen=max_points)
+        self.servo_dead = collections.deque(maxlen=max_points)
         self.loopcount = collections.deque(maxlen=max_points)
         self.adc_count = collections.deque(maxlen=max_points)
         self.control_count = collections.deque(maxlen=max_points)
@@ -61,6 +70,15 @@ class TelemetryBuffer:
         self.kp.append(fields.get("Kp", 0.0))
         self.ki.append(fields.get("Ki", 0.0))
         self.kd.append(fields.get("Kd", 0.0))
+        self.neutral.append(fields.get("Neutral", 84.0))
+        self.travel.append(fields.get("Travel", 30.0))
+        self.direction.append(fields.get("Dir", -1.0))
+        self.pid_dead.append(fields.get("PidDead", 0.0))
+        self.settle_err.append(fields.get("SettleErr", 0.0))
+        self.settle_deriv.append(fields.get("SettleDeriv", 0.0))
+        self.servo_filt.append(fields.get("ServoFilt", 0.0))
+        self.servo_rate.append(fields.get("ServoRate", 0.0))
+        self.servo_dead.append(fields.get("ServoDead", 0.0))
         self.loopcount.append(fields.get("LoopCount", 0.0))
         self.adc_count.append(fields.get("ADC", 0.0))
         self.control_count.append(fields.get("Control", 0.0))
@@ -142,7 +160,7 @@ def main() -> int:
 
     fig, axes = plt.subplots(4, 1, sharex=True, figsize=(11, 9))
     fig.canvas.manager.set_window_title("ESP32 Telemetry Plot")
-    plot_bottom = 0.40 if not args.no_controls else 0.08
+    plot_bottom = 0.42 if not args.no_controls else 0.08
     plot_top = 0.93
     fig.subplots_adjust(bottom=plot_bottom, top=plot_top)
     fig.suptitle("ESP32 ball-balance telemetry")
@@ -186,31 +204,123 @@ def main() -> int:
 
     sliders = {}
     slider_guard = {"enabled": True}
+    controls_visible = {"value": True}
 
     if not args.no_controls:
-        slider_axes = {
-            "setpoint": fig.add_axes([0.10, 0.28, 0.70, 0.03]),
-            "kp": fig.add_axes([0.10, 0.24, 0.70, 0.03]),
-            "ki": fig.add_axes([0.10, 0.20, 0.70, 0.03]),
-            "kd": fig.add_axes([0.10, 0.16, 0.70, 0.03]),
-            "servo": fig.add_axes([0.10, 0.12, 0.70, 0.03]),
+        # Parameter metadata: unit and explanation
+        param_info = {
+            "setpoint": ("cm", "Desired ball distance from sensor. Target setpoint for control."),
+            "kp": ("gain", "Proportional gain. Higher = faster response to distance error."),
+            "ki": ("gain", "Integral gain. Eliminates steady-state error over time."),
+            "kd": ("gain", "Derivative gain. Dampens oscillations and smooths response."),
+            "servo": ("°", "Manual servo angle override. Range 54-114° (±30° from neutral)."),
+            "neutral": ("°", "Servo neutral angle at zero beam tilt. Default 84°."),
+            "travel": ("°", "Maximum servo travel range in each direction from neutral."),
+            "dir": ("±1", "Control direction. 1=forward, -1=reverse. Flips command sign."),
+            "piddead": ("cm", "PID error deadband. Ignores errors smaller than this threshold."),
+            "settleerr": ("cm", "Settle zone error threshold. Below this with low derivative, output goes to zero."),
+            "settlederiv": ("cm/s", "Settle zone derivative threshold. Prevents hunting near setpoint."),
+            "servofilt": ("α", "Servo angle smoothing filter alpha (0-1). Higher = more responsive."),
+            "servorate": ("°/cycle", "Servo rate limiter. Maximum angle change per control cycle."),
+            "servodead": ("°", "Servo deadband. Minimum angle change to trigger PWM write (chatter suppression)."),
         }
 
-        sliders["setpoint"] = Slider(slider_axes["setpoint"], "Set", 0.0, 30.0, valinit=5.0, valstep=0.1)
-        sliders["kp"] = Slider(slider_axes["kp"], "Kp", 0.0, 50.0, valinit=10.0, valstep=0.1)
-        sliders["ki"] = Slider(slider_axes["ki"], "Ki", 0.0, 5.0, valinit=0.010, valstep=0.001, valfmt="%1.3f")
-        sliders["kd"] = Slider(slider_axes["kd"], "Kd", 0.0, 20.0, valinit=2.0, valstep=0.1)
-        sliders["servo"] = Slider(slider_axes["servo"], "Angle", 0.0, 180.0, valinit=90.0, valstep=1.0)
+        slider_specs = [
+            ("setpoint", "Set", 0.0, 30.0, 5.0, 0.1, "%.2f", "set"),
+            ("kp", "Kp", 0.0, 50.0, 10.0, 0.1, "%.2f", "kp"),
+            ("ki", "Ki", 0.0, 5.0, 0.010, 0.001, "%.3f", "ki"),
+            ("kd", "Kd", 0.0, 20.0, 2.0, 0.1, "%.2f", "kd"),
+            ("servo", "Angle", 54.0, 114.0, 84.0, 1.0, "%.0f", "angle"),
+            ("neutral", "Neutral", 0.0, 180.0, 84.0, 1.0, "%.0f", "neutral"),
+            ("travel", "Travel", 1.0, 60.0, 30.0, 1.0, "%.0f", "travel"),
+            ("dir", "Dir", -1.0, 1.0, 1.0, 2.0, "%.0f", "dir"),
+            ("piddead", "PidDead", 0.0, 2.0, 0.20, 0.01, "%.2f", "piddead"),
+            ("settleerr", "SetErr", 0.0, 2.0, 0.6, 0.01, "%.2f", "settleerr"),
+            ("settlederiv", "SetDer", 0.0, 0.50, 0.08, 0.001, "%.3f", "settlederiv"),
+            ("servofilt", "SrvFlt", 0.0, 1.0, 0.08, 0.01, "%.2f", "servofilter"),
+            ("servorate", "SrvRate", 0.05, 5.0, 0.35, 0.05, "%.2f", "servorate"),
+            ("servodead", "SrvDead", 0.0, 5.0, 1.50, 0.05, "%.2f", "servodead"),
+        ]
+
+        slider_axes = {}
+        info_texts = {}
+        left_x = 0.10
+        right_x = 0.52
+        width = 0.32
+        height = 0.025
+        top_row = 0.31
+        row_gap = 0.035
+        cols = [left_x, right_x]
+
+        def create_info_popup(key: str) -> None:
+            """Display parameter info in a popup window."""
+            if key not in param_info:
+                return
+            unit, explanation = param_info[key]
+            
+            # Create a simple info window using matplotlib text
+            info_window = plt.figure(figsize=(6, 3))
+            info_window.suptitle(f"Parameter Info: {key.upper()}", fontsize=12, fontweight="bold")
+            
+            ax = info_window.add_subplot(111)
+            ax.axis("off")
+            
+            # Display unit and explanation
+            info_text = f"Unit: {unit}\n\nExplanation:\n{explanation}"
+            ax.text(0.5, 0.5, info_text, ha="center", va="center", fontsize=11, 
+                   wrap=True, bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+            
+            plt.tight_layout()
+            plt.show(block=False)
+
+        for idx, spec in enumerate(slider_specs):
+            key, label, vmin, vmax, valinit, valstep, valfmt, _command = spec
+            col = idx % 2
+            row = idx // 2
+            axis = fig.add_axes([cols[col], top_row - row * row_gap, width, height])
+            slider_axes[key] = axis
+            sliders[key] = Slider(axis, label, vmin, vmax, valinit=valinit, valstep=valstep, valfmt=valfmt)
+            sliders[key].valtext.set_fontsize(9)
+            
+            # Add info icon text next to each slider (clickable)
+            info_x = cols[col] + width + 0.01
+            info_y = top_row - row * row_gap + 0.008
+            info_text = fig.text(info_x, info_y, "ⓘ", fontsize=10, ha="left", va="center",
+                                color="darkblue", weight="bold", picker=True)
+            info_texts[key] = info_text
+            
+            # Bind click event to info icon
+            def make_click_handler(param_key):
+                def on_info_click(event):
+                    if event.artist == info_texts[param_key]:
+                        create_info_popup(param_key)
+                return on_info_click
+            
+            fig.canvas.mpl_connect("pick_event", make_click_handler(key))
+
+        def set_controls_visible(visible: bool) -> None:
+            controls_visible["value"] = visible
+            for axis in slider_axes.values():
+                axis.set_visible(visible)
+            # Also hide/show info icons
+            for info_text in info_texts.values():
+                info_text.set_visible(visible)
+            fig.subplots_adjust(bottom=0.42 if visible else 0.10, top=plot_top)
+            fig.canvas.draw_idle()
+
+        set_controls_visible(True)
 
         for slider in sliders.values():
             slider.valtext.set_fontsize(9)
 
         button_axes = {
-            "auto": fig.add_axes([0.84, 0.25, 0.12, 0.05]),
-            "manual": fig.add_axes([0.84, 0.19, 0.12, 0.05]),
-            "reset": fig.add_axes([0.84, 0.13, 0.12, 0.05]),
+            "controls": fig.add_axes([0.84, 0.31, 0.12, 0.05]),
+            "auto": fig.add_axes([0.84, 0.24, 0.12, 0.05]),
+            "manual": fig.add_axes([0.84, 0.17, 0.12, 0.05]),
+            "reset": fig.add_axes([0.84, 0.10, 0.12, 0.05]),
         }
         buttons = {
+            "controls": Button(button_axes["controls"], "HIDE"),
             "auto": Button(button_axes["auto"], "AUTO"),
             "manual": Button(button_axes["manual"], "MANUAL"),
             "reset": Button(button_axes["reset"], "RESET"),
@@ -229,7 +339,22 @@ def main() -> int:
         sliders["ki"].on_changed(lambda value: send_from_slider("ki", value, "{:.3f}"))
         sliders["kd"].on_changed(lambda value: send_from_slider("kd", value, "{:.2f}"))
         sliders["servo"].on_changed(lambda value: send_from_slider("angle", value, "{:.0f}"))
+        sliders["neutral"].on_changed(lambda value: send_from_slider("neutral", value, "{:.0f}"))
+        sliders["travel"].on_changed(lambda value: send_from_slider("travel", value, "{:.0f}"))
+        sliders["dir"].on_changed(lambda value: send_from_slider("dir", value, "{:.0f}"))
+        sliders["piddead"].on_changed(lambda value: send_from_slider("piddead", value, "{:.2f}"))
+        sliders["settleerr"].on_changed(lambda value: send_from_slider("settleerr", value, "{:.2f}"))
+        sliders["settlederiv"].on_changed(lambda value: send_from_slider("settlederiv", value, "{:.3f}"))
+        sliders["servofilt"].on_changed(lambda value: send_from_slider("servofilter", value, "{:.2f}"))
+        sliders["servorate"].on_changed(lambda value: send_from_slider("servorate", value, "{:.2f}"))
+        sliders["servodead"].on_changed(lambda value: send_from_slider("servodead", value, "{:.2f}"))
 
+        def toggle_controls(_event):
+            new_state = not controls_visible["value"]
+            set_controls_visible(new_state)
+            buttons["controls"].label.set_text("HIDE" if new_state else "SHOW")
+
+        buttons["controls"].on_clicked(toggle_controls)
         buttons["auto"].on_clicked(lambda _event: send_command(ser, "auto"))
         buttons["manual"].on_clicked(lambda _event: send_command(ser, "manual:on"))
         buttons["reset"].on_clicked(lambda _event: send_command(ser, "reset"))
@@ -337,6 +462,15 @@ def main() -> int:
                     sliders["ki"].set_val(buf.ki[-1])
                     sliders["kd"].set_val(buf.kd[-1])
                     sliders["servo"].set_val(buf.servo[-1])
+                    sliders["neutral"].set_val(buf.neutral[-1])
+                    sliders["travel"].set_val(buf.travel[-1])
+                    sliders["dir"].set_val(buf.direction[-1])
+                    sliders["piddead"].set_val(buf.pid_dead[-1])
+                    sliders["settleerr"].set_val(buf.settle_err[-1])
+                    sliders["settlederiv"].set_val(buf.settle_deriv[-1])
+                    sliders["servofilt"].set_val(buf.servo_filt[-1])
+                    sliders["servorate"].set_val(buf.servo_rate[-1])
+                    sliders["servodead"].set_val(buf.servo_dead[-1])
                 finally:
                     slider_guard["enabled"] = True
 
@@ -346,7 +480,8 @@ def main() -> int:
                 f"Servo: {buf.servo[-1]:.1f}"
             )
             gains_text.set_text(
-                f"Set: {buf.setpoint[-1]:.2f} | Kp: {buf.kp[-1]:.2f} | Ki: {buf.ki[-1]:.3f} | Kd: {buf.kd[-1]:.2f} | Out: {buf.output[-1]:.1f}"
+                f"Set: {buf.setpoint[-1]:.2f} | Kp: {buf.kp[-1]:.2f} | Ki: {buf.ki[-1]:.3f} | Kd: {buf.kd[-1]:.2f} | "
+                f"Neutral: {buf.neutral[-1]:.0f} | Travel: {buf.travel[-1]:.0f} | Dir: {buf.direction[-1]:.0f} | Out: {buf.output[-1]:.1f}"
             )
             loopcount_text.set_text(
                 f"Loop: {int(buf.loopcount[-1])} | ADC: {int(buf.adc_count[-1])} | Ctrl: {int(buf.control_count[-1])}"
