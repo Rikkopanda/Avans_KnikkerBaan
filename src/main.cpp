@@ -237,8 +237,8 @@ double maSum = 0.0;
 double lastValidDistance = -1.0;
 const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger than this
 
-double PID_DERIVATIVE_ALPHA = 0.85;
-double PID_OUTPUT_ALPHA = 0.35;
+double PID_DERIVATIVE_ALPHA = 0.4;  // Lighter filter = less phase lag on derivative
+double PID_OUTPUT_ALPHA = 0.5;      // Moderate output smoothing
 
 double PID_ERROR_DEADBAND_CM = 0.20;
 
@@ -670,41 +670,27 @@ void loop()
   // Servo neutral is calibrated at 84°; positive beam tilt maps above or below neutral
   // theta_servo = neutral + (alpha_beam / gain)
   double servoAngleFromBeam = desiredBeamAngleDeg / LEVER_TO_BEAM_GAIN;
-  double autoServoAngle = SERVO_NEUTRAL_DEG - servoAngleFromBeam;
+  double autoServoAngle = SERVO_NEUTRAL_DEG + servoAngleFromBeam;
   autoServoAngle = constrain(autoServoAngle, servoMinDeg(), servoMaxDeg());
 
+  // ===== SERVO OUTPUT: write directly, no EMA / rate-limit / interval gate =====
+  // Stacked filters (EMA + rate limit + 30ms write interval) introduced phase lag
+  // which caused the sustained oscillation. Remove them all. The servo hardware
+  // provides its own mechanical smoothing. If buzzing becomes a problem, re-enable
+  // only SERVO_WRITE_MIN_STEP_DEG=1 gating, not the rate limiter or EMA.
   if (!manualServoOverride) {
-    double prevFiltered = filteredServoAngle;
-    // Exponential moving average towards target to smooth small jitter
-    double ema = SERVO_FILTER_ALPHA * autoServoAngle + (1.0 - SERVO_FILTER_ALPHA) * filteredServoAngle;
-
-    // Apply rate limit to avoid sudden jumps
-    double delta = ema - prevFiltered;
-    delta = constrain(delta, -SERVO_RATE_LIMIT_DEG, SERVO_RATE_LIMIT_DEG);
-    filteredServoAngle = prevFiltered + delta;
-
-    // If close enough to target, snap to avoid micro-oscillation
-    if (fabs(filteredServoAngle - autoServoAngle) < SERVO_DEADBAND_DEG) {
-      filteredServoAngle = autoServoAngle;
-    }
+    filteredServoAngle = autoServoAngle;
   } else {
     filteredServoAngle = constrain((double)manualServoAngle, servoMinDeg(), servoMaxDeg());
   }
 
-  // // Hold the servo steady if the command is essentially unchanged.
-  // if (fabs(filteredServoAngle - lastWrittenServoAngle) < SERVO_WRITE_MIN_STEP_DEG) {
-  //   filteredServoAngle = lastWrittenServoAngle;
-  // }
-
   loopCounter++;
-    // Serial.printf("millis() - loopTimer:%lu\n\n", millis() - loopTimer);
 
   if (millis() - loopTimer >= 1000)
   {
     savedCount = loopCounter;
     savedAdcCount = adcCount;
     savedControlCount = controlCount;
-    // Serial.printf("LoopsPerSec:%lu | ADC/s:%lu | Control/s:%lu\n", savedCount, savedAdcCount, savedControlCount);
     loopCounter = 0;
     adcCount = 0;
     controlCount = 0;
@@ -712,14 +698,12 @@ void loop()
   }
 
   int servoAngle = (int)round(filteredServoAngle);
-  
-  if (currentMillis - previousMillis >= interval_write_servo) {
-    if (abs(servoAngle - lastWrittenServoAngle) >= SERVO_WRITE_MIN_STEP_DEG) {
-      controlCount++;
-      previousMillis = currentMillis;
-      lastWrittenServoAngle = servoAngle;
-      writeServoAngle(servoAngle);
-    }
+
+  // Write every loop when angle changes — no 30ms gate, no minimum-step gate
+  if (servoAngle != lastWrittenServoAngle) {
+    controlCount++;
+    lastWrittenServoAngle = servoAngle;
+    writeServoAngle(servoAngle);
   }
 
   if (currentMillis - lastTelemetryMs >= telemetryIntervalMs) {
