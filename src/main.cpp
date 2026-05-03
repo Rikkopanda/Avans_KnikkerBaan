@@ -1,4 +1,10 @@
 #include <Arduino.h>
+#include <math.h>
+
+// Ensure M_PI is defined (for asin/atan math)
+#ifndef M_PI
+  #define M_PI 3.14159265358979323846
+#endif
 
 // ===== SERVO PWM SETUP (ESP32 LEDC) =====
 const int SERVO_PIN = 27;          // GPIO 27 for servo signal
@@ -22,6 +28,41 @@ const int MAX7219_CS_PIN = 5;
 #else
   #define dist_sensor 34    // Analog sensor on A1
 #endif
+
+// ===== SYSTEM PARAMETERS (Knikkerban Ball-on-Beam) =====
+// Physical system constants from theoretical model (Lagrangian dynamics)
+const double BALL_MASS_KG = 0.0055;         // kg (mass)
+const double BALL_RADIUS_MM = 15.0;         // mm (radius for rolling constraint)
+const double BALL_RADIUS_M = BALL_RADIUS_MM / 1000.0;  // m
+const double BEAM_L_FRONT_CM = 14.0;        // Distance from pivot to ball (front), cm
+const double BEAM_L_BACK_CM = 8.5;          // Distance from pivot to ball (back), cm
+const double LEVER_OFFSET_MM = 16.0;        // Lever arm offset, mm
+const double BEAM_LENGTH_CM = 14.0;         // Effective beam length for kinematics
+
+// Physics constants
+const double GRAVITY_M_S2 = 9.81;           // m/s² (gravitational acceleration)
+const double BALL_MOMENT_INERTIA = (2.0/5.0) * BALL_MASS_KG * BALL_RADIUS_M * BALL_RADIUS_M;  // kg·m² (solid sphere: J=2/5*m*r²)
+const double INERTIA_FACTOR = 1.0 + (BALL_MOMENT_INERTIA / (BALL_MASS_KG * BALL_RADIUS_M * BALL_RADIUS_M));  // ≈ 1.4 for sphere
+
+// Kinematic/Dynamic relationships:
+// Servo angle (theta) → Beam angle (alpha): alpha [rad] = (d/L) * theta [rad]
+// Beam angle → Ball acceleration (rolling no-slip constraint from Lagrangian):
+//   a_ball = g * sin(alpha) / I_factor
+//   where I_factor = 1 + J/(m*R²) ≈ 1.4 accounts for rolling inertia
+//
+// Control strategy (physics-based):
+// 1. IR sensor measures ball position on beam
+// 2. PID computes desired ball acceleration from position error
+// 3. Convert acceleration to required beam angle: alpha = arcsin(a / (g / I_factor))
+// 4. Convert beam angle to servo angle using lever gain
+// 5. Servo applies torque → lever tilts beam → gravity accelerates rolling ball
+
+const double LEVER_TO_BEAM_GAIN = LEVER_OFFSET_MM / (BEAM_LENGTH_CM * 10.0);  // ~0.114 rad/rad
+double desiredBeamAngleDeg = 0.0;          // Intermediate: desired beam tilt in degrees
+double desiredBeamAngleRad = 0.0;          // Intermediate: desired beam tilt in radians
+double desiredAccelerationMPS2 = 0.0;      // Intermediate: desired ball acceleration (m/s²)
+double ballVelocityMPS = 0.0;              // Estimated ball velocity (m/s)
+double ballPositionM = 0.0;                // Ball position in meters (from sensor in cm)
 
 bool initServoPwm()
 {
@@ -116,14 +157,28 @@ int potpin = A0;  // Potentiometer connected to A0
 
 int val;          // Variable to store potentiometer value
 unsigned long previousMillis = 0;
-const long interval_write_servo = 5;  // Update every 15ms instead of delay(15)
+const long interval_write_servo = 20;  // Update every 20ms (50Hz) to reduce servo jitter
 #ifdef USE_HC_SR04
   const long RANGE_READ_INTERVAL_MS = 65; // HC-SR04 needs ~60ms between measurements
   unsigned long lastRangeReadMs = 0;
 #endif
 double prevError = 0;
 double integral = 0;  // Accumulated error for integral term
-double Kp = 10.0;
+
+// ===== PID TUNING NOTES =====
+// System: lightweight ball (5.5g) rolling on tilted beam via servo-driven lever
+// - Kp: proportional gain. Units: (m/s²) / m of position error
+//   Maps position error (m) → desired acceleration (m/s²)
+//   E.g., 1 meter error → Kp m/s² acceleration command
+//   Try: Kp = 5-15 for this mass. Start with Kp=10 (10 m/s² per meter of error)
+// - Ki: integral gain (cumulative error → correction). Keep small (0.01-0.05)
+// - Kd: derivative gain (dampens oscillation). 0.5-2.0 typical for smooth response
+// 
+// Tuning tips:
+// - If ball oscillates: increase Kd or reduce Kp
+// - If response is sluggish: increase Kp or Ki
+// - Physics naturally filters: gravity provides restoring force on tilted beam
+double Kp = 10.0;   // (m/s²) per meter of position error
 double Ki = 0.01;
 double Kd = 2.0;
 double distance;
@@ -152,6 +207,15 @@ int adcIndex = 0;
 bool adcFilled = false;
 
 const double DISTANCE_FILTER_ALPHA = 0.10;
+
+// ===== moving average + spike rejection =====
+const int MOVING_AVG_SIZE = 8; // simple moving average window
+double maBuffer[MOVING_AVG_SIZE];
+int maIndex = 0;
+bool maFilled = false;
+double maSum = 0.0;
+double lastValidDistance = -1.0;
+const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger than this
 
 const double PID_DERIVATIVE_ALPHA = 0.85;
 const double PID_OUTPUT_ALPHA = 0.35;
@@ -313,15 +377,34 @@ void leesSensorEnPot()
 
     if (voltage > 0.10)
     {
-      rawDistance =
-          13.0 / voltage;
+      rawDistance = 13.0 / voltage;
 
-      distance =
-          DISTANCE_CAL_SCALE * rawDistance +
-          DISTANCE_CAL_OFFSET;
+      distance = DISTANCE_CAL_SCALE * rawDistance + DISTANCE_CAL_OFFSET;
 
-      distance =
-          constrain(distance, 4.0, 30.0);
+      distance = constrain(distance, 4.0, 30.0);
+
+      // Update simple moving average buffer
+      if (maFilled) {
+        maSum -= maBuffer[maIndex];
+      }
+      maBuffer[maIndex] = distance;
+      maSum += distance;
+      maIndex++;
+      if (maIndex >= MOVING_AVG_SIZE) {
+        maIndex = 0;
+        maFilled = true;
+      }
+
+      double maCount = maFilled ? MOVING_AVG_SIZE : maIndex;
+      double maDistance = maSum / (maCount > 0 ? maCount : 1);
+
+      // Spike detection: if distance deviates too much from moving average, treat as spike
+      if (lastValidDistance >= 0 && fabs(distance - maDistance) > SPIKE_DISTANCE_THRESHOLD) {
+        // ignore spike: use moving average instead
+        distance = maDistance;
+      }
+
+      lastValidDistance = distance;
 
       if (filteredDistance < 0)
       {
@@ -329,10 +412,7 @@ void leesSensorEnPot()
       }
       else
       {
-        filteredDistance =
-            DISTANCE_FILTER_ALPHA * distance +
-            (1.0 - DISTANCE_FILTER_ALPHA) *
-            filteredDistance;
+        filteredDistance = DISTANCE_FILTER_ALPHA * distance + (1.0 - DISTANCE_FILTER_ALPHA) * filteredDistance;
       }
     }
 
@@ -352,7 +432,9 @@ void leesSensorEnPot()
 
 double PD_regelaar()
 {
-  // Bereken fout
+  // Physics-based controller: distance error → ball acceleration
+  // Distance error on beam is converted to desired ball acceleration via PID
+  // Bereken fout (position error in cm)
   double controlDistance = (filteredDistance >= 0) ? filteredDistance : distance;
   if (controlDistance < 0) {
     return lastPidOutput;
@@ -362,32 +444,32 @@ double PD_regelaar()
     prevControlDistance = controlDistance;
   }
 
+  // Position error (cm)
   error = setpoint - controlDistance;
   if (fabs(error) < PID_ERROR_DEADBAND_CM) {
     error = 0.0;
   }
 
-  // Differentiate the measured distance instead of the error to avoid setpoint kick.
+  // Differentiate the measured distance (not error) to avoid setpoint kick
   double measurementDelta = controlDistance - prevControlDistance;
   prevControlDistance = controlDistance;
 
   const double dt = 0.015;
-  double derivative =
-      -measurementDelta / dt;
-  // double derivative = -measurementDelta;
+  double derivative = -measurementDelta / dt;
   filteredDerivative = PID_DERIVATIVE_ALPHA * filteredDerivative + (1.0 - PID_DERIVATIVE_ALPHA) * derivative;
 
-  integral += error;  // Accumulate error for integral term
-  
-  // Limit integral windup
+  integral += error;
   integral = constrain(integral, -1000, 1000);
-  // Ki = 0;
   prevError = error;
 
-  // PID uitgang
-  double rawOutput = Kp * error + Ki * integral + Kd * filteredDerivative;
+  // PID output: desired ball acceleration (m/s²)
+  // Kp maps position error (cm) to acceleration. Convert error to meters first.
+  double errorM = error / 100.0;  // Convert cm to m
+  double rawOutput = Kp * errorM + Ki * integral + Kd * filteredDerivative;
   lastPidOutput = PID_OUTPUT_ALPHA * lastPidOutput + (1.0 - PID_OUTPUT_ALPHA) * rawOutput;
-  return lastPidOutput;
+  
+  // Limit acceleration command (±2 m/s² reasonable for 5.5g ball)
+  return constrain(lastPidOutput, -2.0, 2.0);  // m/s²
 }
 
 void handleSerialCommand()
@@ -472,16 +554,37 @@ void loop()
   leesSensorEnPot();
   // displayDistance(distance);
 
-  output = constrain(PD_regelaar(), -90, 90); // Beperk beweging
+  // ===== CONTROL LAW: Distance Error → Acceleration → Beam Angle → Servo Angle =====
+  // Step 1: PID computes desired ball acceleration from distance error (m/s²)
+  desiredAccelerationMPS2 = PD_regelaar();  // m/s²
 
-  // Zet om naar servo positie (0-180 graden)
-  double autoServoAngle = 90.0 - output;
+  // Step 2: Convert acceleration to beam angle using rolling dynamics
+  // a = g * sin(alpha) / I_factor
+  // => alpha = arcsin(a * I_factor / g)
+  // Clamp to reasonable beam angles (±30°)
+  double accelRatio = desiredAccelerationMPS2 * INERTIA_FACTOR / GRAVITY_M_S2;
+  accelRatio = constrain(accelRatio, -1.0, 1.0);  // sin is bounded [-1, 1]
+  desiredBeamAngleRad = asin(accelRatio);
+  desiredBeamAngleDeg = desiredBeamAngleRad * (180.0 / M_PI);  // Convert to degrees
+
+  // Step 3: Convert beam angle to servo angle using lever kinematics
+  // Servo at 90° neutral; positive servo angle → positive beam tilt
+  // theta_servo = 90 + (alpha_beam / gain)
+  double servoAngleFromBeam = desiredBeamAngleDeg / LEVER_TO_BEAM_GAIN;
+  double autoServoAngle = 90.0 + servoAngleFromBeam;
   autoServoAngle = constrain(autoServoAngle, 0.0, 180.0);
 
   if (!manualServoOverride) {
-    double delta = autoServoAngle - filteredServoAngle;
+    double prevFiltered = filteredServoAngle;
+    // Exponential moving average towards target to smooth small jitter
+    double ema = SERVO_FILTER_ALPHA * autoServoAngle + (1.0 - SERVO_FILTER_ALPHA) * filteredServoAngle;
+
+    // Apply rate limit to avoid sudden jumps
+    double delta = ema - prevFiltered;
     delta = constrain(delta, -SERVO_RATE_LIMIT_DEG, SERVO_RATE_LIMIT_DEG);
-    filteredServoAngle += delta;
+    filteredServoAngle = prevFiltered + delta;
+
+    // If close enough to target, snap to avoid micro-oscillation
     if (fabs(filteredServoAngle - autoServoAngle) < SERVO_DEADBAND_DEG) {
       filteredServoAngle = autoServoAngle;
     }
@@ -514,8 +617,9 @@ void loop()
 
   if (currentMillis - lastTelemetryMs >= telemetryIntervalMs) {
     lastTelemetryMs = currentMillis;
-    // Plot-friendly line: values stay numeric and label each signal.
-    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Int:%.2f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
-                  manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, integral, output, filteredServoAngle, Kp, Ki, Kd, savedCount, savedAdcCount, savedControlCount);
+    // Plot-friendly line: full physics-based control chain
+    // Accel = desired acceleration (m/s²), BeamCmd = beam angle from dynamics, Servo = servo PWM angle
+    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,Beam:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f\n",
+                  manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2, desiredBeamAngleDeg, filteredServoAngle, Kp, Ki, Kd);
   }
 }
