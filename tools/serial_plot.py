@@ -41,6 +41,9 @@ class TelemetryBuffer:
         self.kp = collections.deque(maxlen=max_points)
         self.ki = collections.deque(maxlen=max_points)
         self.kd = collections.deque(maxlen=max_points)
+        self.loopcount = collections.deque(maxlen=max_points)
+        self.adc_count = collections.deque(maxlen=max_points)
+        self.control_count = collections.deque(maxlen=max_points)
 
     def append(self, fields: dict[str, float]) -> None:
         now = time.monotonic() - self.t0
@@ -58,6 +61,9 @@ class TelemetryBuffer:
         self.kp.append(fields.get("Kp", 0.0))
         self.ki.append(fields.get("Ki", 0.0))
         self.kd.append(fields.get("Kd", 0.0))
+        self.loopcount.append(fields.get("LoopCount", 0.0))
+        self.adc_count.append(fields.get("ADC", 0.0))
+        self.control_count.append(fields.get("Control", 0.0))
 
 
 
@@ -136,8 +142,13 @@ def main() -> int:
 
     fig, axes = plt.subplots(4, 1, sharex=True, figsize=(11, 9))
     fig.canvas.manager.set_window_title("ESP32 Telemetry Plot")
-    fig.subplots_adjust(bottom=0.40 if not args.no_controls else 0.08, top=0.93)
+    plot_bottom = 0.40 if not args.no_controls else 0.08
+    plot_top = 0.93
+    fig.subplots_adjust(bottom=plot_bottom, top=plot_top)
     fig.suptitle("ESP32 ball-balance telemetry")
+
+    # Track which subplot is enlarged (None = all visible)
+    enlarged_axis = [None]
 
     lines = {}
     lines["dist"] = build_plot(axes[0], [], [], "Dist", "tab:blue")
@@ -171,6 +182,7 @@ def main() -> int:
 
     status = fig.text(0.01, 0.015, f"Port: {args.port}", fontsize=9)
     gains_text = fig.text(0.50, 0.015, "Set: -- | Kp: -- | Ki: -- | Kd: -- | Servo: --", fontsize=9, ha="center")
+    loopcount_text = fig.text(0.99, 0.015, "Loop: -- | ADC: -- | Ctrl: --", fontsize=9, ha="right")
 
     sliders = {}
     slider_guard = {"enabled": True}
@@ -222,6 +234,72 @@ def main() -> int:
         buttons["manual"].on_clicked(lambda _event: send_command(ser, "manual:on"))
         buttons["reset"].on_clicked(lambda _event: send_command(ser, "reset"))
 
+    def on_click(event):
+        """Toggle enlarged view when clicking on a plot."""
+        if event.inaxes is None:
+            return
+        
+        clicked_idx = None
+        for idx, ax in enumerate(axes):
+            if event.inaxes == ax:
+                clicked_idx = idx
+                break
+        
+        if clicked_idx is None:
+            return
+        
+        # Store original positions if not already stored
+        if not hasattr(on_click, 'original_positions'):
+            on_click.original_positions = [ax.get_position() for ax in axes]
+        
+        # Toggle: if this axis is enlarged, show all; otherwise, enlarge this one
+        if enlarged_axis[0] == clicked_idx:
+            # Return to normal 4-subplot view
+            enlarged_axis[0] = None
+            for idx, ax in enumerate(axes):
+                ax.set_visible(True)
+                ax.set_position(on_click.original_positions[idx])
+            fig.subplots_adjust(bottom=plot_bottom, top=plot_top, hspace=0.3)
+        else:
+            # Enlarge this one to fill most of the figure
+            enlarged_axis[0] = clicked_idx
+            for idx, ax in enumerate(axes):
+                ax.set_visible(idx == clicked_idx)
+            # Set position to fill figure (left, bottom, width, height in figure coords 0-1)
+            axes[clicked_idx].set_position([0.08, plot_bottom, 0.88, plot_top - plot_bottom])
+        
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("button_press_event", on_click)
+
+    def on_key(event):
+        """Handle keyboard shortcuts for axis scaling."""
+        if enlarged_axis[0] is None or event.key is None:
+            return
+        
+        ax = axes[enlarged_axis[0]]
+        ymin, ymax = ax.get_ylim()
+        ymid = (ymin + ymax) / 2
+        yrange = ymax - ymin
+        
+        if event.key in ['+', '=']:
+            # Zoom in (narrow range)
+            new_range = yrange * 0.8
+            ax.set_ylim(ymid - new_range / 2, ymid + new_range / 2)
+            fig.canvas.draw_idle()
+        elif event.key in ['-', '_']:
+            # Zoom out (widen range)
+            new_range = yrange * 1.2
+            ax.set_ylim(ymid - new_range / 2, ymid + new_range / 2)
+            fig.canvas.draw_idle()
+        elif event.key == 'r':
+            # Reset to auto scale
+            ax.relim()
+            ax.autoscale_view()
+            fig.canvas.draw_idle()
+    
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
     def update(_frame):
         updated = False
         while ser.in_waiting:
@@ -269,6 +347,9 @@ def main() -> int:
             )
             gains_text.set_text(
                 f"Set: {buf.setpoint[-1]:.2f} | Kp: {buf.kp[-1]:.2f} | Ki: {buf.ki[-1]:.3f} | Kd: {buf.kd[-1]:.2f} | Out: {buf.output[-1]:.1f}"
+            )
+            loopcount_text.set_text(
+                f"Loop: {int(buf.loopcount[-1])} | ADC: {int(buf.adc_count[-1])} | Ctrl: {int(buf.control_count[-1])}"
             )
 
         return tuple(lines.values())

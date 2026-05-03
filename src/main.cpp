@@ -116,7 +116,7 @@ int potpin = A0;  // Potentiometer connected to A0
 
 int val;          // Variable to store potentiometer value
 unsigned long previousMillis = 0;
-const long interval_write_servo = 15;  // Update every 15ms instead of delay(15)
+const long interval_write_servo = 5;  // Update every 15ms instead of delay(15)
 #ifdef USE_HC_SR04
   const long RANGE_READ_INTERVAL_MS = 65; // HC-SR04 needs ~60ms between measurements
   unsigned long lastRangeReadMs = 0;
@@ -141,19 +141,41 @@ double lastPidOutput = 0.0;
 double prevControlDistance = -1.0;
 double filteredDerivative = 0.0;
 
-const double DISTANCE_FILTER_ALPHA = 0.2;
+// ===== timing =====
+const unsigned long ADC_INTERVAL_US = 500;   // 2kHz
+unsigned long lastAdcUs = 0;
+
+// ===== sensor filtering =====
+const int MEDIAN_SIZE = 50;
+uint16_t adcBuffer[MEDIAN_SIZE];
+int adcIndex = 0;
+bool adcFilled = false;
+
+const double DISTANCE_FILTER_ALPHA = 0.10;
+
 const double PID_DERIVATIVE_ALPHA = 0.85;
 const double PID_OUTPUT_ALPHA = 0.35;
+
 const double PID_ERROR_DEADBAND_CM = 0.10;
+
 const double SERVO_FILTER_ALPHA = 0.25;
 const double SERVO_DEADBAND_DEG = 1.0;
 const double SERVO_RATE_LIMIT_DEG = 3.0;
-
 // Calibrated from user measurements:
 // 5.4 cm printed -> 4.0 cm actual
 // 11.3 cm printed -> 10.0 cm actual
 const double DISTANCE_CAL_SCALE = 1.0169491525;
 const double DISTANCE_CAL_OFFSET = -1.4915254237;
+
+unsigned long loopCounter = 0;
+unsigned long loopTimer = 0;
+unsigned long savedCount = 0;
+unsigned long adcCount = 0;
+unsigned long controlCount = 0;
+unsigned long savedAdcCount = 0;
+unsigned long savedControlCount = 0;
+unsigned long telemetryIntervalMs = 50;
+unsigned long lastTelemetryMs = 0;
 
 void setup()
 {  
@@ -219,7 +241,28 @@ double readHC_SR04() {
   return -1.0;  // No valid echo
 }
 #endif
+uint16_t median9(uint16_t* arr)
+{
+  uint16_t temp[MEDIAN_SIZE];
 
+  for (int i = 0; i < MEDIAN_SIZE; i++)
+    temp[i] = arr[i];
+
+  for (int i = 0; i < MEDIAN_SIZE - 1; i++)
+  {
+    for (int j = i + 1; j < MEDIAN_SIZE; j++)
+    {
+      if (temp[j] < temp[i])
+      {
+        uint16_t t = temp[i];
+        temp[i] = temp[j];
+        temp[j] = t;
+      }
+    }
+  }
+
+  return temp[MEDIAN_SIZE / 2];
+}
 void leesSensorEnPot()
 {
   #ifdef USE_HC_SR04
@@ -239,23 +282,58 @@ void leesSensorEnPot()
       // Serial.println("HC-SR04 no echo");
     }
   #else
-    // Original analog sensor
-    sensorRaw = analogRead(dist_sensor);
-    voltage = analogReadMilliVolts(dist_sensor) / 1000.0;
+    // sample ADC continuously at 2kHz
+    // if (micros() - lastAdcUs >= ADC_INTERVAL_US)
+    // {
+      lastAdcUs = micros();
 
-    if (voltage > 0.10) {
-      rawDistance = 13.0 / voltage;  // rough inverse fit for GP2Y0A41SK0F
-      distance = DISTANCE_CAL_SCALE * rawDistance + DISTANCE_CAL_OFFSET;
-      distance = constrain(distance, 4.0, 30.0);
-      if (filteredDistance < 0) {
-        filteredDistance = distance;
-      } else {
-        filteredDistance = DISTANCE_FILTER_ALPHA * distance + (1.0 - DISTANCE_FILTER_ALPHA) * filteredDistance;
+      adcBuffer[adcIndex] =
+          analogRead(dist_sensor);
+      adcCount++;
+
+      adcIndex++;
+      if (adcIndex >= MEDIAN_SIZE)
+      {
+        adcIndex = 0;
+        adcFilled = true;
       }
-    } else {
-      rawDistance = -1.0;
-      distance = -1.0;
-      filteredDistance = -1.0;
+    // }
+
+    // only update measurement once enough samples
+    if (!adcFilled)
+      return;
+
+    // median kills spikes
+    sensorRaw =
+        median9(adcBuffer);
+
+    // use ESP32 calibrated ADC
+    voltage =
+        sensorRaw * 3.3 / 4095.0;
+
+    if (voltage > 0.10)
+    {
+      rawDistance =
+          13.0 / voltage;
+
+      distance =
+          DISTANCE_CAL_SCALE * rawDistance +
+          DISTANCE_CAL_OFFSET;
+
+      distance =
+          constrain(distance, 4.0, 30.0);
+
+      if (filteredDistance < 0)
+      {
+        filteredDistance = distance;
+      }
+      else
+      {
+        filteredDistance =
+            DISTANCE_FILTER_ALPHA * distance +
+            (1.0 - DISTANCE_FILTER_ALPHA) *
+            filteredDistance;
+      }
     }
 
     GP2Y0A41SK0F(distance);
@@ -292,7 +370,11 @@ double PD_regelaar()
   // Differentiate the measured distance instead of the error to avoid setpoint kick.
   double measurementDelta = controlDistance - prevControlDistance;
   prevControlDistance = controlDistance;
-  double derivative = -measurementDelta;
+
+  const double dt = 0.015;
+  double derivative =
+      -measurementDelta / dt;
+  // double derivative = -measurementDelta;
   filteredDerivative = PID_DERIVATIVE_ALPHA * filteredDerivative + (1.0 - PID_DERIVATIVE_ALPHA) * derivative;
 
   integral += error;  // Accumulate error for integral term
@@ -407,14 +489,33 @@ void loop()
     filteredServoAngle = manualServoAngle;
   }
 
-  int servoAngle = (int)round(filteredServoAngle);
+  loopCounter++;
+    // Serial.printf("millis() - loopTimer:%lu\n\n", millis() - loopTimer);
 
+  if (millis() - loopTimer >= 1000)
+  {
+    savedCount = loopCounter;
+    savedAdcCount = adcCount;
+    savedControlCount = controlCount;
+    // Serial.printf("LoopsPerSec:%lu | ADC/s:%lu | Control/s:%lu\n", savedCount, savedAdcCount, savedControlCount);
+    loopCounter = 0;
+    adcCount = 0;
+    controlCount = 0;
+    loopTimer = millis();
+  }
+
+  int servoAngle = (int)round(filteredServoAngle);
+  
   if (currentMillis - previousMillis >= interval_write_servo) {
+    controlCount++;
     previousMillis = currentMillis;
     writeServoAngle(servoAngle);
-    
+  }
+
+  if (currentMillis - lastTelemetryMs >= telemetryIntervalMs) {
+    lastTelemetryMs = currentMillis;
     // Plot-friendly line: values stay numeric and label each signal.
-    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Int:%.2f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f\n",
-                  manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, integral, output, filteredServoAngle, Kp, Ki, Kd);
+    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Int:%.2f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
+                  manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, integral, output, filteredServoAngle, Kp, Ki, Kd, savedCount, savedAdcCount, savedControlCount);
   }
 }
