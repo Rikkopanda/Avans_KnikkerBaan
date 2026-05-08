@@ -65,12 +65,6 @@ double desiredAccelerationMPS2 = 0.0;      // Intermediate: desired ball acceler
 double ballVelocityMPS = 0.0;              // Estimated ball velocity (m/s)
 double ballPositionM = 0.0;                // Ball position in meters (from sensor in cm)
 
-// PID component diagnostics (telemetry)
-double pid_p = 0.0;
-double pid_i = 0.0;
-double pid_d = 0.0;
-double pid_deriv_cm_s = 0.0;
-
 double SERVO_NEUTRAL_DEG = 84.0;
 double SERVO_TRAVEL_LIMIT_DEG = 30.0;
 double CONTROL_DIRECTION = -1.0;  // Flip this if the ball moves the wrong way
@@ -243,17 +237,17 @@ double maSum = 0.0;
 double lastValidDistance = -1.0;
 const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger than this
 
-double PID_DERIVATIVE_ALPHA = 0.2;  // Lighter filter = less phase lag on derivative
-double PID_OUTPUT_ALPHA = 0.5;      // Moderate output smoothing
+double PID_DERIVATIVE_ALPHA = 0.4;  // Lighter filter = less phase lag on derivative
+double PID_OUTPUT_ALPHA = 1.0;      // No output smoothing — use raw PID output directly
 
 double PID_ERROR_DEADBAND_CM = 0.20;
 
-double SERVO_FILTER_ALPHA = 0.15;   // Slightly more responsive filter
-double SERVO_DEADBAND_DEG = 0.8;    // Tighter deadband for more precise control
-double SERVO_RATE_LIMIT_DEG = 0.8;  // Faster rate limit so servo can respond to fast ball movement
+double SERVO_FILTER_ALPHA = 0.15;
+double SERVO_DEADBAND_DEG = 0.8;
+double SERVO_RATE_LIMIT_DEG = 0.8;
 // Settle deadband: only zero the output when BOTH error AND derivative are truly tiny.
 // Keep these small — a 0.8cm settle window was freezing the servo with 1cm of error.
-double SETTLE_ERROR_DEADBAND_CM = 0.20;   // only "settled" within 2.5mm of target
+double SETTLE_ERROR_DEADBAND_CM = 0.25;   // only "settled" within 2.5mm of target
 double SETTLE_DERIVATIVE_DEADBAND = 0.03; // and nearly stopped
 const int SERVO_WRITE_MIN_STEP_DEG = 1;
 // Calibrated from user measurements:
@@ -516,25 +510,15 @@ double PD_regelaar()
   double derivativeM = filteredDerivative / 100.0;
   double rawOutput = Kp * errorM + Ki * integral + Kd * derivativeM;
 
-  // Publish PID component contributions for telemetry / diagnostic plotting
-  pid_p = Kp * errorM;      // proportional term (m/s^2)
-  pid_i = Ki * integral;    // integral term (m/s^2)
-  pid_d = Kd * derivativeM; // derivative term (m/s^2)
-  pid_deriv_cm_s = filteredDerivative; // raw derivative in cm/s
-
-  // When the ball is close and slow, stop pushing harder. This prevents hunting.
+  // When ball is truly at rest at target, hold servo still.
+  // Conditions must BOTH be met — error AND velocity near zero.
   if (fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND) {
     rawOutput = 0.0;
-    integral *= 0.95;
+    integral *= 0.95;  // slow integral bleed to avoid windup while settled
   }
 
-  // NOTE: The output-softening block near zero error was removed.
-  // Multiplying rawOutput by 0.35 near the setpoint was suppressing the
-  // derivative term right where damping matters most, causing oscillation.
-
-  lastPidOutput = PID_OUTPUT_ALPHA * lastPidOutput + (1.0 - PID_OUTPUT_ALPHA) * rawOutput;
-  
-  // Limit acceleration command (±2 m/s² reasonable for 5.5g ball)
+  // No output smoothing — return raw PID output directly for minimum lag
+  lastPidOutput = rawOutput;
   return constrain(lastPidOutput, -1.0, 1.0);  // m/s²
 }
 
@@ -684,7 +668,7 @@ void loop()
   // Servo neutral is calibrated at 84°; positive beam tilt maps above or below neutral
   // theta_servo = neutral + (alpha_beam / gain)
   double servoAngleFromBeam = desiredBeamAngleDeg / LEVER_TO_BEAM_GAIN;
-  double autoServoAngle = SERVO_NEUTRAL_DEG + servoAngleFromBeam;
+  double autoServoAngle = SERVO_NEUTRAL_DEG - servoAngleFromBeam;
   autoServoAngle = constrain(autoServoAngle, servoMinDeg(), servoMaxDeg());
 
   // ===== SERVO OUTPUT: write directly, no EMA / rate-limit / interval gate =====
@@ -724,8 +708,7 @@ void loop()
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
     // Out = beam command in degrees, Servo = actual servo angle in degrees
-    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
-                    manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2,
-                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, servoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
+    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,ServoDead:%.2f\n",
+                    manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, SERVO_DEADBAND_DEG);
   }
 }

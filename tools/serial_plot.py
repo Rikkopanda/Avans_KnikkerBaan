@@ -34,10 +34,15 @@ class TelemetryBuffer:
         self.volt = collections.deque(maxlen=max_points)
         self.dist = collections.deque(maxlen=max_points)
         self.distf = collections.deque(maxlen=max_points)
+        self.accel = collections.deque(maxlen=max_points)
         self.err = collections.deque(maxlen=max_points)
         self.integral = collections.deque(maxlen=max_points)
         self.output = collections.deque(maxlen=max_points)
         self.servo = collections.deque(maxlen=max_points)
+        self.pout = collections.deque(maxlen=max_points)
+        self.dout = collections.deque(maxlen=max_points)
+        self.iout = collections.deque(maxlen=max_points)
+        self.deriv = collections.deque(maxlen=max_points)
         self.kp = collections.deque(maxlen=max_points)
         self.ki = collections.deque(maxlen=max_points)
         self.kd = collections.deque(maxlen=max_points)
@@ -63,10 +68,15 @@ class TelemetryBuffer:
         self.volt.append(fields.get("Volt", 0.0))
         self.dist.append(fields.get("Dist", 0.0))
         self.distf.append(fields.get("DistF", 0.0))
+        self.accel.append(fields.get("Accel", 0.0))
         self.err.append(fields.get("Err", 0.0))
         self.integral.append(fields.get("Int", 0.0))
         self.output.append(fields.get("Out", 0.0))
         self.servo.append(fields.get("Servo", 0.0))
+        self.pout.append(fields.get("POut", 0.0))
+        self.dout.append(fields.get("DOut", 0.0))
+        self.iout.append(fields.get("IOut", 0.0))
+        self.deriv.append(fields.get("Deriv", 0.0))
         self.kp.append(fields.get("Kp", 0.0))
         self.ki.append(fields.get("Ki", 0.0))
         self.kd.append(fields.get("Kd", 0.0))
@@ -171,6 +181,7 @@ def main() -> int:
     lines = {}
     lines["dist"] = build_plot(axes[0], [], [], "Dist", "tab:blue")
     lines["distf"] = build_plot(axes[0], [], [], "DistF", "tab:cyan")
+    lines["accel"] = build_plot(axes[0], [], [], "Accel", "tab:green")
     lines["set"] = build_plot(axes[0], [], [], "Setpoint", "tab:orange", 1.2)
     axes[0].set_ylabel("cm")
     axes[0].legend(loc="upper right")
@@ -179,6 +190,7 @@ def main() -> int:
 
     lines["err"] = build_plot(axes[1], [], [], "Err", "tab:red")
     lines["int"] = build_plot(axes[1], [], [], "Int", "tab:purple")
+    lines["deriv"] = build_plot(axes[1], [], [], "Deriv", "tab:cyan")
     axes[1].set_ylabel("error")
     axes[1].legend(loc="upper right")
     axes[1].grid(True, alpha=0.25)
@@ -186,6 +198,9 @@ def main() -> int:
 
     lines["out"] = build_plot(axes[2], [], [], "Out", "tab:green")
     lines["servo"] = build_plot(axes[2], [], [], "Servo", "tab:brown")
+    lines["pout"] = build_plot(axes[2], [], [], "POut", "tab:olive")
+    lines["dout"] = build_plot(axes[2], [], [], "DOut", "tab:cyan")
+    lines["iout"] = build_plot(axes[2], [], [], "IOut", "tab:pink")
     axes[2].set_ylabel("output / deg")
     axes[2].legend(loc="upper right")
     axes[2].grid(True, alpha=0.25)
@@ -201,6 +216,9 @@ def main() -> int:
     status = fig.text(0.01, 0.015, f"Port: {args.port}", fontsize=9)
     gains_text = fig.text(0.50, 0.015, "Set: -- | Kp: -- | Ki: -- | Kd: -- | Servo: --", fontsize=9, ha="center")
     loopcount_text = fig.text(0.99, 0.015, "Loop: -- | ADC: -- | Ctrl: --", fontsize=9, ha="right")
+    help_text = fig.text(0.01, 0.96, 
+        "Click chart to enlarge  •  Scroll wheel to zoom  •  ↑↓ to pan  •  +/- to zoom when enlarged  •  R to reset", 
+        fontsize=8, style="italic", color="darkgray")
 
     sliders = {}
     slider_guard = {"enabled": True}
@@ -305,6 +323,7 @@ def main() -> int:
             # Also hide/show info icons
             for info_text in info_texts.values():
                 info_text.set_visible(visible)
+            help_text.set_visible(visible)
             fig.subplots_adjust(bottom=0.42 if visible else 0.10, top=plot_top)
             fig.canvas.draw_idle()
 
@@ -318,13 +337,114 @@ def main() -> int:
             "auto": fig.add_axes([0.84, 0.24, 0.12, 0.05]),
             "manual": fig.add_axes([0.84, 0.17, 0.12, 0.05]),
             "reset": fig.add_axes([0.84, 0.10, 0.12, 0.05]),
+            "all": fig.add_axes([0.84, 0.03, 0.12, 0.05]),
         }
         buttons = {
             "controls": Button(button_axes["controls"], "HIDE"),
             "auto": Button(button_axes["auto"], "AUTO"),
             "manual": Button(button_axes["manual"], "MANUAL"),
             "reset": Button(button_axes["reset"], "RESET"),
+            "all": Button(button_axes["all"], "ALL"),
         }
+
+        overview_state = {"fig": None, "axis": None, "lines": {}, "text": None}
+
+        def open_all_in_one_view(_event=None):
+            existing_fig = overview_state["fig"]
+            if existing_fig is not None and plt.fignum_exists(existing_fig.number):
+                try:
+                    existing_fig.canvas.manager.show()
+                except Exception:
+                    pass
+                return
+
+            overview_fig, overview_ax = plt.subplots(figsize=(14, 8))
+            overview_fig.canvas.manager.set_window_title("ESP32 all-in-one telemetry")
+            overview_fig.suptitle("ESP32 all-in-one telemetry")
+            overview_fig.subplots_adjust(top=0.90, bottom=0.10, left=0.07, right=0.98)
+
+            overview_lines = {}
+            overview_lines["dist"] = build_plot(overview_ax, [], [], "Dist", "tab:blue")
+            overview_lines["distf"] = build_plot(overview_ax, [], [], "DistF", "tab:cyan")
+            overview_lines["accel"] = build_plot(overview_ax, [], [], "Accel", "tab:green")
+            overview_lines["set"] = build_plot(overview_ax, [], [], "Setpoint", "tab:orange", 1.2)
+            overview_lines["err"] = build_plot(overview_ax, [], [], "Err", "tab:red")
+            overview_lines["int"] = build_plot(overview_ax, [], [], "Int", "tab:purple")
+            overview_lines["deriv"] = build_plot(overview_ax, [], [], "Deriv", "tab:olive")
+            overview_lines["pout"] = build_plot(overview_ax, [], [], "POut", "tab:pink")
+            overview_lines["dout"] = build_plot(overview_ax, [], [], "DOut", "tab:brown")
+            overview_lines["iout"] = build_plot(overview_ax, [], [], "IOut", "tab:gray")
+            overview_lines["out"] = build_plot(overview_ax, [], [], "Out", "tab:green")
+            overview_lines["servo"] = build_plot(overview_ax, [], [], "Servo", "tab:blue", 1.2)
+            overview_lines["volt"] = build_plot(overview_ax, [], [], "Volt", "tab:cyan")
+            overview_lines["raw"] = build_plot(overview_ax, [], [], "Raw", "tab:purple")
+            overview_lines["loopcount"] = build_plot(overview_ax, [], [], "Loop/s", "tab:orange")
+            overview_lines["adc_count"] = build_plot(overview_ax, [], [], "ADC/s", "tab:red")
+            overview_lines["control_count"] = build_plot(overview_ax, [], [], "Ctrl/s", "tab:olive")
+
+            overview_ax.set_ylabel("mixed units")
+            overview_ax.set_xlabel("time (s)")
+            overview_ax.legend(loc="upper right", ncol=4, fontsize=8)
+            overview_ax.grid(True, alpha=0.25)
+
+            overview_text = overview_fig.text(0.01, 0.01, "", fontsize=9, family="monospace")
+
+            overview_state["fig"] = overview_fig
+            overview_state["axis"] = overview_ax
+            overview_state["lines"] = overview_lines
+            overview_state["text"] = overview_text
+
+            def close_overview(_event):
+                overview_state["fig"] = None
+                overview_state["axis"] = None
+                overview_state["lines"] = {}
+                overview_state["text"] = None
+
+            overview_fig.canvas.mpl_connect("close_event", close_overview)
+
+        def update_all_in_one_view() -> None:
+            overview_fig = overview_state["fig"]
+            overview_axis = overview_state["axis"]
+            overview_lines = overview_state["lines"]
+            overview_text = overview_state["text"]
+            if overview_fig is None or overview_axis is None or not buf.time_s:
+                return
+
+            x = list(buf.time_s)
+            overview_lines["dist"].set_data(x, list(buf.dist))
+            overview_lines["distf"].set_data(x, list(buf.distf))
+            overview_lines["accel"].set_data(x, list(buf.accel))
+            overview_lines["set"].set_data(x, list(buf.setpoint))
+
+            overview_lines["err"].set_data(x, list(buf.err))
+            overview_lines["int"].set_data(x, list(buf.integral))
+            overview_lines["deriv"].set_data(x, list(buf.deriv))
+
+            overview_lines["pout"].set_data(x, list(buf.pout))
+            overview_lines["dout"].set_data(x, list(buf.dout))
+            overview_lines["iout"].set_data(x, list(buf.iout))
+            overview_lines["out"].set_data(x, list(buf.output))
+
+            overview_lines["servo"].set_data(x, list(buf.servo))
+            overview_lines["volt"].set_data(x, list(buf.volt))
+            overview_lines["raw"].set_data(x, list(buf.raw))
+
+            overview_lines["loopcount"].set_data(x, list(buf.loopcount))
+            overview_lines["adc_count"].set_data(x, list(buf.adc_count))
+            overview_lines["control_count"].set_data(x, list(buf.control_count))
+
+            overview_axis.relim()
+            overview_axis.autoscale_view()
+
+            if overview_text is not None:
+                overview_text.set_text(
+                    f"Neutral={buf.neutral[-1]:.0f}  Travel={buf.travel[-1]:.0f}  Dir={buf.direction[-1]:.0f}  "
+                    f"PidDead={buf.pid_dead[-1]:.2f}  SettleErr={buf.settle_err[-1]:.2f}  "
+                    f"SettleDeriv={buf.settle_deriv[-1]:.3f}  ServoFilt={buf.servo_filt[-1]:.3f}  "
+                    f"ServoRate={buf.servo_rate[-1]:.2f}  ServoDead={buf.servo_dead[-1]:.2f}"
+                )
+
+            overview_fig.canvas.draw_idle()
 
         def send_from_slider(prefix: str, value: float, fmt: str) -> None:
             if not slider_guard["enabled"]:
@@ -358,6 +478,11 @@ def main() -> int:
         buttons["auto"].on_clicked(lambda _event: send_command(ser, "auto"))
         buttons["manual"].on_clicked(lambda _event: send_command(ser, "manual:on"))
         buttons["reset"].on_clicked(lambda _event: send_command(ser, "reset"))
+        buttons["all"].on_clicked(open_all_in_one_view)
+
+    else:
+        # When controls are hidden, also hide help text
+        help_text.set_visible(False)
 
     def on_click(event):
         """Toggle enlarged view when clicking on a plot."""
@@ -422,8 +547,45 @@ def main() -> int:
             ax.relim()
             ax.autoscale_view()
             fig.canvas.draw_idle()
+        elif event.key in ['up', 'down']:
+            # Pan up/down with arrow keys
+            pan_amount = yrange * 0.1 if event.key == 'up' else -yrange * 0.1
+            ax.set_ylim(ymin + pan_amount, ymax + pan_amount)
+            fig.canvas.draw_idle()
+    
+    def on_scroll(event):
+        """Handle mouse wheel zooming on any chart."""
+        if event.inaxes is None:
+            return
+        
+        # Find which axis was scrolled on
+        clicked_idx = None
+        for idx, ax in enumerate(axes):
+            if event.inaxes == ax:
+                clicked_idx = idx
+                break
+        
+        if clicked_idx is None:
+            return
+        
+        ax = axes[clicked_idx]
+        ymin, ymax = ax.get_ylim()
+        ymid = (ymin + ymax) / 2
+        yrange = ymax - ymin
+        
+        # Scroll up = zoom in, scroll down = zoom out
+        if event.button == 'up':
+            new_range = yrange * 0.85
+        elif event.button == 'down':
+            new_range = yrange * 1.15
+        else:
+            return
+        
+        ax.set_ylim(ymid - new_range / 2, ymid + new_range / 2)
+        fig.canvas.draw_idle()
     
     fig.canvas.mpl_connect("key_press_event", on_key)
+    fig.canvas.mpl_connect("scroll_event", on_scroll)
 
     def update(_frame):
         updated = False
@@ -441,11 +603,16 @@ def main() -> int:
         x = list(buf.time_s)
         lines["dist"].set_data(x, list(buf.dist))
         lines["distf"].set_data(x, list(buf.distf))
+        lines["accel"].set_data(x, list(buf.accel))
         lines["set"].set_data(x, list(buf.setpoint))
         lines["err"].set_data(x, list(buf.err))
         lines["int"].set_data(x, list(buf.integral))
+        lines["deriv"].set_data(x, list(buf.deriv))
         lines["out"].set_data(x, list(buf.output))
         lines["servo"].set_data(x, list(buf.servo))
+        lines["pout"].set_data(x, list(buf.pout))
+        lines["dout"].set_data(x, list(buf.dout))
+        lines["iout"].set_data(x, list(buf.iout))
         lines["volt"].set_data(x, list(buf.volt))
 
         # Always autoscale to show data
@@ -484,8 +651,10 @@ def main() -> int:
                 f"Neutral: {buf.neutral[-1]:.0f} | Travel: {buf.travel[-1]:.0f} | Dir: {buf.direction[-1]:.0f} | Out: {buf.output[-1]:.1f}"
             )
             loopcount_text.set_text(
-                f"Loop: {int(buf.loopcount[-1])} | ADC: {int(buf.adc_count[-1])} | Ctrl: {int(buf.control_count[-1])}"
+                f"Loop/s: {int(buf.loopcount[-1])} | ADC/s: {int(buf.adc_count[-1])} | Ctrl/s: {int(buf.control_count[-1])}"
             )
+
+            update_all_in_one_view()
 
         return tuple(lines.values())
 
