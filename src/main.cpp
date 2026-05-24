@@ -227,7 +227,7 @@ const unsigned long ADC_INTERVAL_US = 500;   // 2kHz
 unsigned long lastAdcUs = 0;
 
 // ===== sensor filtering =====
-const int MEDIAN_SIZE = 50;
+const int MEDIAN_SIZE = 9;
 uint16_t adcBuffer[MEDIAN_SIZE];
 int adcIndex = 0;
 bool adcFilled = false;
@@ -243,7 +243,7 @@ double maSum = 0.0;
 double lastValidDistance = -1.0;
 const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger than this
 
-double PID_DERIVATIVE_ALPHA = 0.2;  // Lighter filter = less phase lag on derivative
+double PID_DERIVATIVE_ALPHA = 0.7;  // Stronger filter to reduce derivative spikes
 double PID_OUTPUT_ALPHA = 0.5;      // Moderate output smoothing
 
 double PID_ERROR_DEADBAND_CM = 0.20;
@@ -269,7 +269,7 @@ unsigned long adcCount = 0;
 unsigned long controlCount = 0;
 unsigned long savedAdcCount = 0;
 unsigned long savedControlCount = 0;
-unsigned long telemetryIntervalMs = 50;
+unsigned long telemetryIntervalMs = 200;
 unsigned long lastTelemetryMs = 0;
 int lastWrittenServoAngle = (int)SERVO_NEUTRAL_DEG;
 
@@ -378,9 +378,9 @@ void leesSensorEnPot()
       // Serial.println("HC-SR04 no echo");
     }
   #else
-    // sample ADC continuously at 2kHz
-    // if (micros() - lastAdcUs >= ADC_INTERVAL_US)
-    // {
+    // sample ADC at a fixed rate using ADC_INTERVAL_US to make dt predictable
+    if (micros() - lastAdcUs >= ADC_INTERVAL_US)
+    {
       lastAdcUs = micros();
 
       adcBuffer[adcIndex] =
@@ -393,7 +393,7 @@ void leesSensorEnPot()
         adcIndex = 0;
         adcFilled = true;
       }
-    // }
+    }
 
     // only update measurement once enough samples
     if (!adcFilled)
