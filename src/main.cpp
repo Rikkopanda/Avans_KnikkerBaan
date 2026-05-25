@@ -222,6 +222,17 @@ double lastPidOutput = 0.0;
 double prevControlDistance = -1.0;
 double filteredDerivative = 0.0;
 
+enum MeasurementSource {
+  SOURCE_SENSOR = 0,
+  SOURCE_VISION = 1
+};
+
+MeasurementSource measurementSource = SOURCE_SENSOR;
+double visionDistance = -1.0;
+double visionFilteredDistance = -1.0;
+unsigned long lastVisionUpdateMs = 0;
+const double VISION_FILTER_ALPHA = 0.20;
+
 // ===== timing =====
 const unsigned long ADC_INTERVAL_US = 500;   // 2kHz
 unsigned long lastAdcUs = 0;
@@ -272,6 +283,27 @@ unsigned long savedControlCount = 0;
 unsigned long telemetryIntervalMs = 200;
 unsigned long lastTelemetryMs = 0;
 int lastWrittenServoAngle = (int)SERVO_NEUTRAL_DEG;
+
+void updateExternalVisionDistance(double dist)
+{
+  visionDistance = dist;
+  lastVisionUpdateMs = millis();
+
+  if (dist < 0) {
+    visionFilteredDistance = -1.0;
+    distance = -1.0;
+    filteredDistance = -1.0;
+    return;
+  }
+
+  distance = dist;
+  if (visionFilteredDistance < 0) {
+    visionFilteredDistance = dist;
+  } else {
+    visionFilteredDistance = VISION_FILTER_ALPHA * dist + (1.0 - VISION_FILTER_ALPHA) * visionFilteredDistance;
+  }
+  filteredDistance = visionFilteredDistance;
+}
 
 void setup()
 {  
@@ -361,6 +393,17 @@ uint16_t median9(uint16_t* arr)
 }
 void leesSensorEnPot()
 {
+  if (measurementSource == SOURCE_VISION) {
+    if (visionDistance >= 0 && (millis() - lastVisionUpdateMs) <= 500) {
+      updateExternalVisionDistance(visionDistance);
+    } else {
+      updateExternalVisionDistance(-1.0);
+    }
+
+    GP2Y0A41SK0F(distance);
+    return;
+  }
+
   #ifdef USE_HC_SR04
     // Read distance from HC-SR04 no faster than sensor can handle
     if (millis() - lastRangeReadMs >= RANGE_READ_INTERVAL_MS) {
@@ -554,6 +597,22 @@ void handleSerialCommand()
       Serial.println("Servo mode: AUTO");
       return;
     }
+
+    if (cmdLower.startsWith("source:") || cmdLower.startsWith("input:")) {
+      int sep = cmd.indexOf(':');
+      String valueStr = cmd.substring(sep + 1);
+      valueStr.trim();
+      valueStr.toLowerCase();
+
+      if (valueStr == "vision" || valueStr == "cv" || valueStr == "camera") {
+        measurementSource = SOURCE_VISION;
+        Serial.println("Measurement source: VISION");
+      } else if (valueStr == "sensor" || valueStr == "distance" || valueStr == "ir") {
+        measurementSource = SOURCE_SENSOR;
+        Serial.println("Measurement source: SENSOR");
+      }
+      return;
+    }
     
     // Parse command format: "set:value" or "setpoint:value"
     int colonIdx = cmd.indexOf(':');
@@ -651,6 +710,10 @@ void handleSerialCommand()
           Serial.println("Servo mode: AUTO");
         }
       }
+      else if (param == "vision" || param == "ball" || param == "pos") {
+        updateExternalVisionDistance(valueStr.toFloat());
+        Serial.printf("Vision distance updated to: %.2f\n", distance);
+      }
     }
   }
 }
@@ -724,8 +787,8 @@ void loop()
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
     // Out = beam command in degrees, Servo = actual servo angle in degrees
-    Serial.printf("Plot,Mode:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
-                    manualServoOverride ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2,
+    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
+                    manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2,
                     pid_p, pid_d, pid_i, pid_deriv_cm_s, output, servoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
   }
 }

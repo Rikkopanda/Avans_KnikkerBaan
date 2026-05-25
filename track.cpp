@@ -169,8 +169,8 @@ int main(int argc, char* argv[])
 {
 	//some boolean variables for different functionality within this
 	//program
-    bool trackObjects = false;
-    bool useMorphOps = false;
+    bool trackObjects = true;
+    bool useMorphOps = true;
 	//Matrix to store each frame of the webcam feed
 	Mat cameraFeed;
 	//matrix storage for HSV image

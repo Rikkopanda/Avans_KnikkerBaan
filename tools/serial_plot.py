@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import os
 import re
 import sys
 import time
@@ -19,8 +20,65 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button, Slider
 import serial
 
+try:
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - vision mode is optional
+    cv2 = None
+    np = None
+
 
 SERIAL_RE = re.compile(r"([A-Za-z]+):(-?\d+(?:\.\d+)?)")
+
+VISION_DEFAULT_LOW = (35, 80, 70)
+VISION_DEFAULT_HIGH = (90, 255, 255)
+
+
+def vision_available() -> bool:
+    return cv2 is not None and np is not None
+
+
+def parse_triplet(text: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 3:
+        return default
+    try:
+        return tuple(max(0, int(part)) for part in parts)  # type: ignore[return-value]
+    except ValueError:
+        return default
+
+
+def detect_ball(frame, hsv_low, hsv_high):
+    if cv2 is None or np is None:
+        return None, None
+
+    blurred = cv2.GaussianBlur(frame, (11, 11), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, hsv_low, hsv_high)
+
+    if int(hsv_low[0]) > int(hsv_high[0]):
+        low2 = hsv_low.copy()
+        low2[0] = 0
+        high2 = hsv_high.copy()
+        high2[0] = 179
+        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, low2, high2))
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, mask
+
+    contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(contour)
+    if area < 60.0:
+        return None, mask
+
+    (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+    return (int(center_x), int(center_y), int(radius)), mask
 
 
 class TelemetryBuffer:
@@ -29,6 +87,7 @@ class TelemetryBuffer:
         self.t0 = time.monotonic()
         self.time_s = collections.deque(maxlen=max_points)
         self.mode = collections.deque(maxlen=max_points)
+        self.source = collections.deque(maxlen=max_points)
         self.setpoint = collections.deque(maxlen=max_points)
         self.raw = collections.deque(maxlen=max_points)
         self.volt = collections.deque(maxlen=max_points)
@@ -63,6 +122,7 @@ class TelemetryBuffer:
         now = time.monotonic() - self.t0
         self.time_s.append(now)
         self.mode.append(fields.get("Mode", 0.0))
+        self.source.append(fields.get("Src", 0.0))
         self.setpoint.append(fields.get("Set", 0.0))
         self.raw.append(fields.get("Raw", 0.0))
         self.volt.append(fields.get("Volt", 0.0))
@@ -148,6 +208,13 @@ def main() -> int:
                         help="Y-axis limits for Volt (default: 0 3.3)")
     parser.add_argument("--auto-scale", action="store_true", help="Use automatic y-axis scaling instead of fixed ranges")
     parser.add_argument("--no-controls", action="store_true", help="Hide sliders and manual control buttons")
+    parser.add_argument("--vision-camera", type=int, default=0, help="Camera index used in computer-vision mode")
+    parser.add_argument("--vision-span-cm", type=float, default=30.0,
+                        help="Physical span in cm mapped across the camera width in vision mode")
+    parser.add_argument("--vision-hsv-low", nargs=3, type=int, metavar=("H", "S", "V"), default=list(VISION_DEFAULT_LOW),
+                        help="HSV low threshold for vision mode")
+    parser.add_argument("--vision-hsv-high", nargs=3, type=int, metavar=("H", "S", "V"), default=list(VISION_DEFAULT_HIGH),
+                        help="HSV high threshold for vision mode")
     args = parser.parse_args()
 
     try:
@@ -333,6 +400,7 @@ def main() -> int:
             slider.valtext.set_fontsize(9)
 
         button_axes = {
+            "source": fig.add_axes([0.84, 0.38, 0.12, 0.05]),
             "controls": fig.add_axes([0.84, 0.31, 0.12, 0.05]),
             "auto": fig.add_axes([0.84, 0.24, 0.12, 0.05]),
             "manual": fig.add_axes([0.84, 0.17, 0.12, 0.05]),
@@ -340,12 +408,105 @@ def main() -> int:
             "all": fig.add_axes([0.84, 0.03, 0.12, 0.05]),
         }
         buttons = {
+            "source": Button(button_axes["source"], "SENSOR"),
             "controls": Button(button_axes["controls"], "HIDE"),
             "auto": Button(button_axes["auto"], "AUTO"),
             "manual": Button(button_axes["manual"], "MANUAL"),
             "reset": Button(button_axes["reset"], "RESET"),
             "all": Button(button_axes["all"], "ALL"),
         }
+
+        vision_state = {
+            "enabled": False,
+            "capture": None,
+            "window": "Ball vision source",
+            "hsv_low": np.array(args.vision_hsv_low, dtype=np.uint8) if vision_available() else None,
+            "hsv_high": np.array(args.vision_hsv_high, dtype=np.uint8) if vision_available() else None,
+            "last_sent_cm": None,
+        }
+
+        def open_vision_capture() -> bool:
+            if not vision_available():
+                return False
+            if vision_state["capture"] is None:
+                capture = cv2.VideoCapture(args.vision_camera)
+                if not capture.isOpened():
+                    return False
+                vision_state["capture"] = capture
+            return True
+
+        def close_vision_capture() -> None:
+            capture = vision_state["capture"]
+            if capture is not None:
+                capture.release()
+            vision_state["capture"] = None
+            if cv2 is not None:
+                try:
+                    cv2.destroyWindow(vision_state["window"])
+                except Exception:
+                    pass
+
+        def set_source_mode(enabled: bool) -> None:
+            vision_state["enabled"] = enabled
+            vision_state["last_sent_cm"] = None
+            buttons["source"].label.set_text("CV" if enabled else "SENSOR")
+            try:
+                send_command(ser, "source:vision" if enabled else "source:sensor")
+            except serial.SerialException:
+                pass
+
+            if enabled:
+                if not open_vision_capture():
+                    vision_state["enabled"] = False
+                    buttons["source"].label.set_text("SENSOR")
+                    try:
+                        status.set_text("OpenCV camera unavailable; staying on SENSOR")
+                    except Exception:
+                        pass
+                    return
+            else:
+                close_vision_capture()
+
+        def send_vision_position(position_cm: float) -> None:
+            if vision_state["last_sent_cm"] is not None and abs(position_cm - vision_state["last_sent_cm"]) < 0.05:
+                return
+            vision_state["last_sent_cm"] = position_cm
+            try:
+                send_command(ser, f"vision:{position_cm:.2f}")
+            except serial.SerialException:
+                pass
+
+        def update_vision_source() -> None:
+            if not vision_state["enabled"] or vision_state["capture"] is None or cv2 is None or np is None:
+                return
+
+            ret, frame = vision_state["capture"].read()
+            if not ret:
+                send_vision_position(-1.0)
+                return
+
+            detection, mask = detect_ball(frame, vision_state["hsv_low"], vision_state["hsv_high"])
+            preview = frame.copy()
+
+            if detection is None:
+                send_vision_position(-1.0)
+                cv2.putText(preview, "Ball: lost", (12, 28), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+            else:
+                center_x, center_y, radius = detection
+                position_cm = (center_x / max(1, frame.shape[1])) * args.vision_span_cm
+                send_vision_position(position_cm)
+
+                cv2.circle(preview, (center_x, center_y), radius, (0, 255, 0), 2)
+                cv2.circle(preview, (center_x, center_y), 4, (0, 255, 255), -1)
+                cv2.line(preview, (center_x, 0), (center_x, preview.shape[0]), (255, 0, 0), 1)
+                cv2.putText(preview, f"Ball: {position_cm:.2f} cm", (12, 28), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.putText(preview, f"HSV low: {tuple(int(v) for v in vision_state['hsv_low'])}",
+                        (12, preview.shape[0] - 28), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(preview, f"HSV high: {tuple(int(v) for v in vision_state['hsv_high'])}",
+                        (12, preview.shape[0] - 10), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1)
+            cv2.imshow(vision_state["window"], preview)
+            cv2.waitKey(1)
 
         overview_state = {"fig": None, "axis": None, "lines": {}, "text": None}
 
@@ -474,7 +635,11 @@ def main() -> int:
             set_controls_visible(new_state)
             buttons["controls"].label.set_text("HIDE" if new_state else "SHOW")
 
+        def toggle_source(_event):
+            set_source_mode(not vision_state["enabled"])
+
         buttons["controls"].on_clicked(toggle_controls)
+        buttons["source"].on_clicked(toggle_source)
         buttons["auto"].on_clicked(lambda _event: send_command(ser, "auto"))
         buttons["manual"].on_clicked(lambda _event: send_command(ser, "manual:on"))
         buttons["reset"].on_clicked(lambda _event: send_command(ser, "reset"))
@@ -597,6 +762,9 @@ def main() -> int:
             buf.append(fields)
             updated = True
 
+        if not args.no_controls:
+            update_vision_source()
+
         if not buf.time_s:
             return tuple(lines.values())
 
@@ -643,6 +811,7 @@ def main() -> int:
 
             status.set_text(
                 f"Port: {args.port}  Mode: {'MAN' if buf.mode and buf.mode[-1] else 'AUTO'}  "
+                f"Src: {'CV' if buf.source and buf.source[-1] else 'SENSOR'}  "
                 f"Dist: {buf.dist[-1]:.2f}  DistF: {buf.distf[-1]:.2f}  Err: {buf.err[-1]:.2f}  "
                 f"Servo: {buf.servo[-1]:.1f}"
             )
@@ -661,6 +830,10 @@ def main() -> int:
     anim = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
     plt.show()
     _ = anim
+
+    if not args.no_controls and 'vision_state' in locals():
+        close_vision_capture()
+
     ser.close()
     return 0
 
