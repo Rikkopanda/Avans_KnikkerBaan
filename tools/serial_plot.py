@@ -113,6 +113,7 @@ class TelemetryBuffer:
         self.settle_deriv = collections.deque(maxlen=max_points)
         self.servo_filt = collections.deque(maxlen=max_points)
         self.servo_rate = collections.deque(maxlen=max_points)
+        self.breakaway = collections.deque(maxlen=max_points)
         self.servo_dead = collections.deque(maxlen=max_points)
         self.loopcount = collections.deque(maxlen=max_points)
         self.adc_count = collections.deque(maxlen=max_points)
@@ -148,6 +149,7 @@ class TelemetryBuffer:
         self.settle_deriv.append(fields.get("SettleDeriv", 0.0))
         self.servo_filt.append(fields.get("ServoFilt", 0.0))
         self.servo_rate.append(fields.get("ServoRate", 0.0))
+        self.breakaway.append(fields.get("Breakaway", 0.0))
         self.servo_dead.append(fields.get("ServoDead", 0.0))
         self.loopcount.append(fields.get("LoopCount", 0.0))
         self.adc_count.append(fields.get("ADC", 0.0))
@@ -302,12 +304,13 @@ def main() -> int:
             "neutral": ("°", "Servo neutral angle at zero beam tilt. Default 84°."),
             "travel": ("°", "Maximum servo travel range in each direction from neutral."),
             "dir": ("±1", "Control direction. 1=forward, -1=reverse. Flips command sign."),
-            "piddead": ("cm", "PID error deadband. Ignores errors smaller than this threshold."),
+            "piddead": ("cm", "PID error deadband. When the ball is nearly stopped, errors smaller than this are treated as zero."),
             "settleerr": ("cm", "Settle zone error threshold. Below this with low derivative, output goes to zero."),
             "settlederiv": ("cm/s", "Settle zone derivative threshold. Prevents hunting near setpoint."),
             "servofilt": ("α", "Servo angle smoothing filter alpha (0-1). Higher = more responsive."),
             "servorate": ("°/cycle", "Servo rate limiter. Maximum angle change per control cycle."),
-            "servodead": ("°", "Servo deadband. Minimum angle change to trigger PWM write (chatter suppression)."),
+            "breakaway": ("°", "Minimum beam angle used only when the ball is nearly stationary, to overcome static friction."),
+            "servodead": ("°", "Servo deadband. Minimum change before sending a new servo command. Higher reduces chatter; lower reacts sooner."),
         }
 
         slider_specs = [
@@ -324,18 +327,24 @@ def main() -> int:
             ("settlederiv", "SetDer", 0.0, 0.50, 0.08, 0.001, "%.3f", "settlederiv"),
             ("servofilt", "SrvFlt", 0.0, 1.0, 0.08, 0.01, "%.2f", "servofilter"),
             ("servorate", "SrvRate", 0.05, 5.0, 0.35, 0.05, "%.2f", "servorate"),
+            ("breakaway", "BrkAw", 0.0, 3.0, 0.35, 0.01, "%.2f", "breakaway"),
             ("servodead", "SrvDead", 0.0, 5.0, 1.50, 0.05, "%.2f", "servodead"),
         ]
 
         slider_axes = {}
-        info_texts = {}
-        left_x = 0.10
+        info_axes = {}
+        info_buttons = {}
+        left_x = 0.03
         right_x = 0.52
-        width = 0.32
+        width = 0.24
         height = 0.025
         top_row = 0.31
         row_gap = 0.035
         cols = [left_x, right_x]
+        info_width = 0.018
+        info_gap = 0.050
+        button_x = 0.945
+        button_width = 0.040
 
         def create_info_popup(key: str) -> None:
             """Display parameter info in a popup window."""
@@ -367,29 +376,21 @@ def main() -> int:
             sliders[key] = Slider(axis, label, vmin, vmax, valinit=valinit, valstep=valstep, valfmt=valfmt)
             sliders[key].valtext.set_fontsize(9)
             
-            # Add info icon text next to each slider (clickable)
-            info_x = cols[col] + width + 0.01
-            info_y = top_row - row * row_gap + 0.008
-            info_text = fig.text(info_x, info_y, "ⓘ", fontsize=10, ha="left", va="center",
-                                color="darkblue", weight="bold", picker=True)
-            info_texts[key] = info_text
-            
-            # Bind click event to info icon
-            def make_click_handler(param_key):
-                def on_info_click(event):
-                    if event.artist == info_texts[param_key]:
-                        create_info_popup(param_key)
-                return on_info_click
-            
-            fig.canvas.mpl_connect("pick_event", make_click_handler(key))
+            info_x = cols[col] + width + info_gap
+            info_y = top_row - row * row_gap
+            info_axis = fig.add_axes([info_x, info_y, info_width, height])
+            info_axes[key] = info_axis
+            info_button = Button(info_axis, "?")
+            info_button.label.set_fontsize(10)
+            info_button.on_clicked(lambda _event, param_key=key: create_info_popup(param_key))
+            info_buttons[key] = info_button
 
         def set_controls_visible(visible: bool) -> None:
             controls_visible["value"] = visible
             for axis in slider_axes.values():
                 axis.set_visible(visible)
-            # Also hide/show info icons
-            for info_text in info_texts.values():
-                info_text.set_visible(visible)
+            for axis in info_axes.values():
+                axis.set_visible(visible)
             help_text.set_visible(visible)
             fig.subplots_adjust(bottom=0.42 if visible else 0.10, top=plot_top)
             fig.canvas.draw_idle()
@@ -400,12 +401,12 @@ def main() -> int:
             slider.valtext.set_fontsize(9)
 
         button_axes = {
-            "source": fig.add_axes([0.84, 0.38, 0.12, 0.05]),
-            "controls": fig.add_axes([0.84, 0.31, 0.12, 0.05]),
-            "auto": fig.add_axes([0.84, 0.24, 0.12, 0.05]),
-            "manual": fig.add_axes([0.84, 0.17, 0.12, 0.05]),
-            "reset": fig.add_axes([0.84, 0.10, 0.12, 0.05]),
-            "all": fig.add_axes([0.84, 0.03, 0.12, 0.05]),
+            "source": fig.add_axes([button_x, 0.38, button_width, 0.05]),
+            "controls": fig.add_axes([button_x, 0.31, button_width, 0.05]),
+            "auto": fig.add_axes([button_x, 0.24, button_width, 0.05]),
+            "manual": fig.add_axes([button_x, 0.17, button_width, 0.05]),
+            "reset": fig.add_axes([button_x, 0.10, button_width, 0.05]),
+            "all": fig.add_axes([button_x, 0.03, button_width, 0.05]),
         }
         buttons = {
             "source": Button(button_axes["source"], "SENSOR"),
@@ -602,7 +603,8 @@ def main() -> int:
                     f"Neutral={buf.neutral[-1]:.0f}  Travel={buf.travel[-1]:.0f}  Dir={buf.direction[-1]:.0f}  "
                     f"PidDead={buf.pid_dead[-1]:.2f}  SettleErr={buf.settle_err[-1]:.2f}  "
                     f"SettleDeriv={buf.settle_deriv[-1]:.3f}  ServoFilt={buf.servo_filt[-1]:.3f}  "
-                    f"ServoRate={buf.servo_rate[-1]:.2f}  ServoDead={buf.servo_dead[-1]:.2f}"
+                    f"ServoRate={buf.servo_rate[-1]:.2f}  Breakaway={buf.breakaway[-1]:.2f}  "
+                    f"ServoDead={buf.servo_dead[-1]:.2f}"
                 )
 
             overview_fig.canvas.draw_idle()
@@ -628,6 +630,7 @@ def main() -> int:
         sliders["settlederiv"].on_changed(lambda value: send_from_slider("settlederiv", value, "{:.3f}"))
         sliders["servofilt"].on_changed(lambda value: send_from_slider("servofilter", value, "{:.2f}"))
         sliders["servorate"].on_changed(lambda value: send_from_slider("servorate", value, "{:.2f}"))
+        sliders["breakaway"].on_changed(lambda value: send_from_slider("breakaway", value, "{:.2f}"))
         sliders["servodead"].on_changed(lambda value: send_from_slider("servodead", value, "{:.2f}"))
 
         def toggle_controls(_event):
@@ -805,6 +808,7 @@ def main() -> int:
                     sliders["settlederiv"].set_val(buf.settle_deriv[-1])
                     sliders["servofilt"].set_val(buf.servo_filt[-1])
                     sliders["servorate"].set_val(buf.servo_rate[-1])
+                    sliders["breakaway"].set_val(buf.breakaway[-1])
                     sliders["servodead"].set_val(buf.servo_dead[-1])
                 finally:
                     slider_guard["enabled"] = True

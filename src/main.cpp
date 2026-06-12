@@ -218,6 +218,7 @@ float voltage;
 bool manualServoOverride = false;
 int manualServoAngle = 84;
 double filteredServoAngle = SERVO_NEUTRAL_DEG;
+bool filteredServoAngleInitialized = false;
 double lastPidOutput = 0.0;
 double prevControlDistance = -1.0;
 double filteredDerivative = 0.0;
@@ -257,15 +258,16 @@ const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger t
 double PID_DERIVATIVE_ALPHA = 0.7;  // Stronger filter to reduce derivative spikes
 double PID_OUTPUT_ALPHA = 0.5;      // Moderate output smoothing
 
-double PID_ERROR_DEADBAND_CM = 0.20;
+double PID_ERROR_DEADBAND_CM = 0.30;
 
 double SERVO_FILTER_ALPHA = 0.15;   // Slightly more responsive filter
 double SERVO_DEADBAND_DEG = 0.8;    // Tighter deadband for more precise control
-double SERVO_RATE_LIMIT_DEG = 0.8;  // Faster rate limit so servo can respond to fast ball movement
+double SERVO_RATE_LIMIT_DEG = 0.5;  // Smaller per-loop step to reduce high-frequency twitching
+double BEAM_BREAKAWAY_DEG = 0.35;   // Minimum beam tilt needed to overcome static friction
 // Settle deadband: only zero the output when BOTH error AND derivative are truly tiny.
 // Keep these small — a 0.8cm settle window was freezing the servo with 1cm of error.
-double SETTLE_ERROR_DEADBAND_CM = 0.20;   // only "settled" within 2.5mm of target
-double SETTLE_DERIVATIVE_DEADBAND = 0.03; // and nearly stopped
+double SETTLE_ERROR_DEADBAND_CM = 0.35;   // settle in a small window near setpoint
+double SETTLE_DERIVATIVE_DEADBAND = 0.60; // cm/s threshold for "nearly stopped"
 const int SERVO_WRITE_MIN_STEP_DEG = 1;
 // Calibrated from user measurements:
 // 5.4 cm printed -> 4.0 cm actual
@@ -319,6 +321,8 @@ void setup()
     Serial.println("ERROR: Failed to initialize servo PWM!");
   }
   writeServoAngle((int)round(SERVO_NEUTRAL_DEG));  // Beam neutral servo position
+  filteredServoAngle = SERVO_NEUTRAL_DEG;
+  filteredServoAngleInitialized = true;
   
   #ifdef USE_HC_SR04
     pinMode(TRIG_PIN, OUTPUT);
@@ -570,8 +574,12 @@ double PD_regelaar()
   pid_d = Kd * derivativeM; // derivative term (m/s^2)
   pid_deriv_cm_s = filteredDerivative; // raw derivative in cm/s
 
-  // When the ball is close and slow, stop pushing harder. This prevents hunting.
-  if (fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND) {
+  // When the ball is inside the deadband and essentially stopped, suppress control.
+  // If it is still moving, keep the derivative term available for damping.
+  if (fabs(error) < PID_ERROR_DEADBAND_CM && fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND) {
+    rawOutput = 0.0;
+    integral *= 0.95;
+  } else if (fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND) {
     rawOutput = 0.0;
     integral *= 0.95;
   }
@@ -687,6 +695,10 @@ void handleSerialCommand()
           SERVO_RATE_LIMIT_DEG = fmax(0.05, (double)valueStr.toFloat());
           Serial.printf("Servo rate limit updated to: %.2f\n", SERVO_RATE_LIMIT_DEG);
         }
+          else if (param == "breakaway") {
+            BEAM_BREAKAWAY_DEG = fmax(0.0, (double)valueStr.toFloat());
+            Serial.printf("Breakaway angle updated to: %.2f\n", BEAM_BREAKAWAY_DEG);
+          }
         else if (param == "servodead") {
           SERVO_DEADBAND_DEG = fmax(0.0, (double)valueStr.toFloat());
           Serial.printf("Servo deadband updated to: %.2f\n", SERVO_DEADBAND_DEG);
@@ -754,6 +766,17 @@ void loop()
   desiredBeamAngleDeg = desiredBeamAngleRad * (180.0 / M_PI);  // Convert to degrees
   desiredBeamAngleDeg = CONTROL_DIRECTION * desiredBeamAngleDeg;
   desiredBeamAngleDeg = constrain(desiredBeamAngleDeg, -maxBeamTiltDeg(), maxBeamTiltDeg());
+
+  // Static friction / stiction compensation:
+  // Only apply a breakaway boost when the ball is already nearly stopped.
+  // That helps it start moving without forcing extra motion while it is rolling.
+  if (fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND &&
+      fabs(error) >= PID_ERROR_DEADBAND_CM &&
+      fabs(desiredBeamAngleDeg) > 0.0 &&
+      fabs(desiredBeamAngleDeg) < BEAM_BREAKAWAY_DEG) {
+    desiredBeamAngleDeg = copysign(BEAM_BREAKAWAY_DEG, desiredBeamAngleDeg);
+  }
+
   output = desiredBeamAngleDeg;
 
   // Step 3: Convert beam angle to servo angle using lever kinematics
@@ -763,15 +786,19 @@ void loop()
   double autoServoAngle = SERVO_NEUTRAL_DEG + servoAngleFromBeam;
   autoServoAngle = constrain(autoServoAngle, servoMinDeg(), servoMaxDeg());
 
-  // ===== SERVO OUTPUT: write directly, no EMA / rate-limit / interval gate =====
-  // Stacked filters (EMA + rate limit + 30ms write interval) introduced phase lag
-  // which caused the sustained oscillation. Remove them all. The servo hardware
-  // provides its own mechanical smoothing. If buzzing becomes a problem, re-enable
-  // only SERVO_WRITE_MIN_STEP_DEG=1 gating, not the rate limiter or EMA.
-  if (!manualServoOverride) {
-    filteredServoAngle = autoServoAngle;
+  // Smooth the servo target a little so tiny control changes do not turn into jitter.
+  double targetServoAngle = manualServoOverride
+      ? constrain((double)manualServoAngle, servoMinDeg(), servoMaxDeg())
+      : autoServoAngle;
+
+  if (!filteredServoAngleInitialized) {
+    filteredServoAngle = targetServoAngle;
+    filteredServoAngleInitialized = true;
   } else {
-    filteredServoAngle = constrain((double)manualServoAngle, servoMinDeg(), servoMaxDeg());
+    double filteredTarget = SERVO_FILTER_ALPHA * targetServoAngle + (1.0 - SERVO_FILTER_ALPHA) * filteredServoAngle;
+    double maxStep = max(0.05, SERVO_RATE_LIMIT_DEG);
+    double delta = constrain(filteredTarget - filteredServoAngle, -maxStep, maxStep);
+    filteredServoAngle = constrain(filteredServoAngle + delta, servoMinDeg(), servoMaxDeg());
   }
 
   loopCounter++;
@@ -789,8 +816,9 @@ void loop()
 
   int servoAngle = (int)round(filteredServoAngle);
 
-  // Write every loop when angle changes — no 30ms gate, no minimum-step gate
-  if (servoAngle != lastWrittenServoAngle) {
+  // Do not send tiny corrections that only excite servo backlash/noise.
+  double writeThresholdDeg = max((double)SERVO_WRITE_MIN_STEP_DEG, SERVO_DEADBAND_DEG);
+  if (fabs(filteredServoAngle - (double)lastWrittenServoAngle) >= writeThresholdDeg) {
     controlCount++;
     lastWrittenServoAngle = servoAngle;
     writeServoAngle(servoAngle);
@@ -800,8 +828,8 @@ void loop()
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
     // Out = beam command in degrees, Servo = actual servo angle in degrees
-    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
+    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
                     manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2,
-                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, servoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
+                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, servoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
   }
 }
