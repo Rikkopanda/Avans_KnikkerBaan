@@ -16,10 +16,15 @@
 #include <sstream>
 #include <string>
 #include <iostream>
+#include <iomanip>
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
 #include <opencv4/opencv2/opencv.hpp>
 
 using namespace cv;
 using namespace std;
+#include <deque>
 //initial min and max HSV filter values.
 //these will be changed using trackbars
 int H_MIN = 0;
@@ -42,6 +47,164 @@ const string windowName1 = "HSV Image";
 const string windowName2 = "Thresholded Image";
 const string windowName3 = "After Morphological Operations";
 const string trackbarWindowName = "Trackbars";
+const string controlsWindowName = "Controls";
+
+const double BEAM_DISTANCE_CM = 30.0;
+
+int SETPOINT_TRACKBAR = 150;
+double setpointCm = 15.0;
+int KP_TRACKBAR = 100;
+int KI_TRACKBAR = 5;
+int KD_TRACKBAR = 40;
+int SERVO_NEUTRAL_TRACKBAR = 84;
+int SERVO_TRAVEL_TRACKBAR = 30;
+int CONTROL_DIRECTION_TRACKBAR = 0;
+int PID_DEADBAND_TRACKBAR = 20;
+int SETTLE_ERROR_TRACKBAR = 20;
+int SETTLE_DERIVATIVE_TRACKBAR = 30;
+int SERVO_FILTER_TRACKBAR = 15;
+int SERVO_RATE_TRACKBAR = 80;
+int SERVO_DEADBAND_TRACKBAR = 8;
+
+Point2f beamStart(-1.0f, -1.0f);
+Point2f beamEnd(-1.0f, -1.0f);
+bool beamHasStart = false;
+bool beamDefined = false;
+double ballPositionCm = -1.0;
+double beamAngleDeg = 0.0;
+double beamLengthPx = 0.0;
+
+class SerialPort {
+public:
+	SerialPort() = default;
+	~SerialPort() { close(); }
+
+	bool openPort(const string &path, int baudRate)
+	{
+		fd_ = ::open(path.c_str(), O_RDWR | O_NOCTTY | O_SYNC | O_NONBLOCK);
+		if (fd_ < 0) {
+			return false;
+		}
+
+		struct termios tty{};
+		if (tcgetattr(fd_, &tty) != 0) {
+			close();
+			return false;
+		}
+
+		speed_t speed = B115200;
+		if (baudRate == 57600) speed = B57600;
+		else if (baudRate == 38400) speed = B38400;
+		else if (baudRate == 19200) speed = B19200;
+		else if (baudRate == 9600) speed = B9600;
+
+		cfsetospeed(&tty, speed);
+		cfsetispeed(&tty, speed);
+		tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+		tty.c_iflag &= ~IGNBRK;
+		tty.c_lflag = 0;
+		tty.c_oflag = 0;
+		tty.c_cc[VMIN]  = 0;
+		tty.c_cc[VTIME] = 1; // short timeout
+		tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+		tty.c_cflag |= (CLOCAL | CREAD);
+		tty.c_cflag &= ~(PARENB | PARODD);
+		tty.c_cflag &= ~CSTOPB;
+		tty.c_cflag &= ~CRTSCTS;
+
+		if (tcsetattr(fd_, TCSANOW, &tty) != 0) {
+			close();
+			return false;
+		}
+
+		return true;
+	}
+
+	void writeLine(const string &line)
+	{
+		if (fd_ < 0) {
+			return;
+		}
+		::write(fd_, line.c_str(), line.size());
+		::write(fd_, "\n", 1);
+	}
+
+	// Read available data and extract full lines (without trailing newline).
+	// Appends found lines to the provided vector and returns true if any data was read.
+	bool readLines(vector<string> &out)
+	{
+		if (fd_ < 0) return false;
+		char buf[256];
+		ssize_t n = ::read(fd_, buf, sizeof(buf));
+		if (n <= 0) return false;
+		readBuf_.append(buf, (size_t)n);
+		size_t pos = 0;
+		while ((pos = readBuf_.find('\n')) != string::npos) {
+			string line = readBuf_.substr(0, pos);
+			// strip CR if present
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			out.push_back(line);
+			readBuf_.erase(0, pos + 1);
+		}
+		return true;
+	}
+
+	bool isOpen() const { return fd_ >= 0; }
+
+private:
+	void close()
+	{
+		if (fd_ >= 0) {
+			::close(fd_);
+			fd_ = -1;
+		}
+	}
+
+	int fd_ = -1;
+	string readBuf_;
+};
+
+SerialPort* activeSerialPort = nullptr;
+
+void sendSerialCommand(const string &command)
+{
+	if (activeSerialPort != nullptr && activeSerialPort->isOpen()) {
+		activeSerialPort->writeLine(command);
+	}
+}
+
+void sendSerialFloat(const string &prefix, double value, int decimals)
+{
+	std::ostringstream payload;
+	payload << prefix << ":" << fixed << setprecision(decimals) << value;
+	sendSerialCommand(payload.str());
+}
+
+void sendSerialInt(const string &prefix, int value)
+{
+	std::ostringstream payload;
+	payload << prefix << ":" << value;
+	sendSerialCommand(payload.str());
+}
+
+void pushCurrentControlState()
+{
+	sendSerialCommand("source:vision");
+	sendSerialFloat("set", setpointCm, 2);
+	sendSerialFloat("kp", KP_TRACKBAR / 10.0, 2);
+	sendSerialFloat("ki", KI_TRACKBAR / 1000.0, 3);
+	sendSerialFloat("kd", KD_TRACKBAR / 10.0, 2);
+	sendSerialFloat("neutral", SERVO_NEUTRAL_TRACKBAR, 1);
+	sendSerialFloat("travel", SERVO_TRAVEL_TRACKBAR, 1);
+	sendSerialInt("dir", CONTROL_DIRECTION_TRACKBAR ? 1 : -1);
+	sendSerialFloat("piddead", PID_DEADBAND_TRACKBAR / 100.0, 2);
+	sendSerialFloat("settleerr", SETTLE_ERROR_TRACKBAR / 100.0, 2);
+	sendSerialFloat("settlederiv", SETTLE_DERIVATIVE_TRACKBAR / 1000.0, 3);
+	sendSerialFloat("servofilter", SERVO_FILTER_TRACKBAR / 100.0, 2);
+	sendSerialFloat("servorate", SERVO_RATE_TRACKBAR / 100.0, 2);
+	sendSerialFloat("servodead", SERVO_DEADBAND_TRACKBAR / 100.0, 2);
+}
+
 void on_trackbar( int, void* )
 {//This function gets called whenever a
 	// trackbar position is changed
@@ -51,6 +214,117 @@ void on_trackbar( int, void* )
 
 
 }
+
+void on_setpoint_trackbar(int, void*)
+{
+	setpointCm = SETPOINT_TRACKBAR / 10.0;
+	sendSerialFloat("set", setpointCm, 2);
+}
+
+void on_kp_trackbar(int, void*)
+{
+	sendSerialFloat("kp", KP_TRACKBAR / 10.0, 2);
+}
+
+void on_ki_trackbar(int, void*)
+{
+	sendSerialFloat("ki", KI_TRACKBAR / 1000.0, 3);
+}
+
+void on_kd_trackbar(int, void*)
+{
+	sendSerialFloat("kd", KD_TRACKBAR / 10.0, 2);
+}
+
+void on_neutral_trackbar(int, void*)
+{
+	sendSerialFloat("neutral", SERVO_NEUTRAL_TRACKBAR, 1);
+}
+
+void on_travel_trackbar(int, void*)
+{
+	sendSerialFloat("travel", SERVO_TRAVEL_TRACKBAR, 1);
+}
+
+void on_dir_trackbar(int, void*)
+{
+	sendSerialInt("dir", CONTROL_DIRECTION_TRACKBAR ? 1 : -1);
+}
+
+void on_piddead_trackbar(int, void*)
+{
+	sendSerialFloat("piddead", PID_DEADBAND_TRACKBAR / 100.0, 2);
+}
+
+void on_settleerr_trackbar(int, void*)
+{
+	sendSerialFloat("settleerr", SETTLE_ERROR_TRACKBAR / 100.0, 2);
+}
+
+void on_settlederiv_trackbar(int, void*)
+{
+	sendSerialFloat("settlederiv", SETTLE_DERIVATIVE_TRACKBAR / 1000.0, 3);
+}
+
+void on_servofilter_trackbar(int, void*)
+{
+	sendSerialFloat("servofilter", SERVO_FILTER_TRACKBAR / 100.0, 2);
+}
+
+void on_servorate_trackbar(int, void*)
+{
+	sendSerialFloat("servorate", SERVO_RATE_TRACKBAR / 100.0, 2);
+}
+
+void on_servodead_trackbar(int, void*)
+{
+	sendSerialFloat("servodead", SERVO_DEADBAND_TRACKBAR / 100.0, 2);
+}
+
+void onMouse(int event, int x, int y, int, void*)
+{
+	if (event == EVENT_RBUTTONDOWN) {
+		beamHasStart = false;
+		beamDefined = false;
+		beamStart = Point2f(-1.0f, -1.0f);
+		beamEnd = Point2f(-1.0f, -1.0f);
+		beamLengthPx = 0.0;
+		ballPositionCm = -1.0;
+		return;
+	}
+
+	if (event != EVENT_LBUTTONDOWN) {
+		return;
+	}
+
+	if (!beamHasStart || beamDefined) {
+		beamStart = Point2f((float)x, (float)y);
+		beamHasStart = true;
+		beamDefined = false;
+		beamEnd = Point2f(-1.0f, -1.0f);
+	} else {
+		beamEnd = Point2f((float)x, (float)y);
+		beamLengthPx = norm(beamEnd - beamStart);
+		beamAngleDeg = atan2(beamEnd.y - beamStart.y, beamEnd.x - beamStart.x) * 180.0 / CV_PI;
+		beamDefined = beamLengthPx > 1.0;
+	}
+}
+
+Point2f projectPointToBeam(const Point2f &point, double &t)
+{
+	Point2f beamVec = beamEnd - beamStart;
+	double len2 = beamVec.dot(beamVec);
+	if (len2 <= 0.0) {
+		t = 0.0;
+		return beamStart;
+	}
+
+	Point2f fromStart = point - beamStart;
+	t = (fromStart.dot(beamVec)) / len2;
+	t = max(0.0, min(1.0, t));
+	return beamStart + beamVec * (float)t;
+}
+
 string intToString(int number){
 
 
@@ -63,6 +337,7 @@ void createTrackbars(){
 
 
     namedWindow(trackbarWindowName,0);
+	namedWindow(controlsWindowName,0);
 	//create trackbars and insert them into window
 	//3 parameters are: the address of the variable that is changing when the trackbar is moved(eg.H_LOW),
 	//the max value the trackbar can move (eg. H_HIGH), 
@@ -74,6 +349,19 @@ void createTrackbars(){
     createTrackbar( "S_MAX", trackbarWindowName, &S_MAX, S_MAX, on_trackbar );
     createTrackbar( "V_MIN", trackbarWindowName, &V_MIN, V_MAX, on_trackbar );
     createTrackbar( "V_MAX", trackbarWindowName, &V_MAX, V_MAX, on_trackbar );
+	createTrackbar( "Setpoint cm", controlsWindowName, &SETPOINT_TRACKBAR, (int)(BEAM_DISTANCE_CM * 10.0), on_setpoint_trackbar );
+	createTrackbar( "Kp x0.1", controlsWindowName, &KP_TRACKBAR, 500, on_kp_trackbar );
+	createTrackbar( "Ki x0.001", controlsWindowName, &KI_TRACKBAR, 5000, on_ki_trackbar );
+	createTrackbar( "Kd x0.1", controlsWindowName, &KD_TRACKBAR, 200, on_kd_trackbar );
+	createTrackbar( "Neutral", controlsWindowName, &SERVO_NEUTRAL_TRACKBAR, 180, on_neutral_trackbar );
+	createTrackbar( "Travel", controlsWindowName, &SERVO_TRAVEL_TRACKBAR, 60, on_travel_trackbar );
+	createTrackbar( "Dir", controlsWindowName, &CONTROL_DIRECTION_TRACKBAR, 1, on_dir_trackbar );
+	createTrackbar( "PidDead x0.01", controlsWindowName, &PID_DEADBAND_TRACKBAR, 200, on_piddead_trackbar );
+	createTrackbar( "SetErr x0.01", controlsWindowName, &SETTLE_ERROR_TRACKBAR, 200, on_settleerr_trackbar );
+	createTrackbar( "SetDer x0.001", controlsWindowName, &SETTLE_DERIVATIVE_TRACKBAR, 500, on_settlederiv_trackbar );
+	createTrackbar( "SrvFilt x0.01", controlsWindowName, &SERVO_FILTER_TRACKBAR, 100, on_servofilter_trackbar );
+	createTrackbar( "SrvRate x0.01", controlsWindowName, &SERVO_RATE_TRACKBAR, 500, on_servorate_trackbar );
+	createTrackbar( "SrvDead x0.01", controlsWindowName, &SERVO_DEADBAND_TRACKBAR, 500, on_servodead_trackbar );
 
 
 }
@@ -167,6 +455,25 @@ void trackFilteredObject(int &x, int &y, Mat threshold, Mat &cameraFeed){
 }
 int main(int argc, char* argv[])
 {
+	string serialPortPath;
+	int serialBaud = 115200;
+	for (int i = 1; i < argc; ++i) {
+		string arg = argv[i];
+		if (arg == "--serial" && i + 1 < argc) {
+			serialPortPath = argv[++i];
+		} else if (arg == "--baud" && i + 1 < argc) {
+			serialBaud = atoi(argv[++i]);
+		}
+	}
+
+	SerialPort serialPort;
+	if (!serialPortPath.empty()) {
+		if (!serialPort.openPort(serialPortPath, serialBaud)) {
+			cerr << "Warning: could not open serial port " << serialPortPath << endl;
+		}
+	}
+	activeSerialPort = &serialPort;
+
 	//some boolean variables for different functionality within this
 	//program
     bool trackObjects = true;
@@ -179,6 +486,7 @@ int main(int argc, char* argv[])
 	Mat threshold;
 	//x and y values for the location of the object
 	int x=0, y=0;
+	setpointCm = SETPOINT_TRACKBAR / 10.0;
 	//create slider bars for HSV filtering
 	createTrackbars();
 	//video capture object to acquire webcam feed
@@ -188,16 +496,30 @@ int main(int argc, char* argv[])
 	//set height and width of capture frame
 	capture.set(CAP_PROP_FRAME_WIDTH,FRAME_WIDTH);
 	capture.set(CAP_PROP_FRAME_HEIGHT,FRAME_HEIGHT);
+	namedWindow(windowName, 1);
+	setMouseCallback(windowName, onMouse, nullptr);
+
+	// Serial console buffer shown in the Controls window
+	deque<string> serialLog;
+	const int maxSerialLines = 12;
+
+	if (serialPort.isOpen()) {
+		pushCurrentControlState();
+	}
 	//start an infinite loop where webcam feed is copied to cameraFeed matrix
 	//all of our operations will be performed within this loop
 	while(1){
 		//store image to matrix
 		capture.read(cameraFeed);
+		if (cameraFeed.empty()) {
+			continue;
+		}
 		//convert frame from BGR to HSV colorspace
 		cvtColor(cameraFeed,HSV,COLOR_BGR2HSV);
 		//filter HSV image between values and store filtered image to
 		//threshold matrix
 		inRange(HSV,Scalar(H_MIN,S_MIN,V_MIN),Scalar(H_MAX,S_MAX,V_MAX),threshold);
+		Mat thresholdDisplay = threshold.clone();
 		//perform morphological operations on thresholded image to eliminate noise
 		//and emphasize the filtered object(s)
 		if(useMorphOps)
@@ -208,10 +530,79 @@ int main(int argc, char* argv[])
 		if(trackObjects)
 			trackFilteredObject(x,y,threshold,cameraFeed);
 
+		if (beamDefined) {
+			line(cameraFeed, beamStart, beamEnd, Scalar(255, 0, 0), 2);
+			circle(cameraFeed, beamStart, 6, Scalar(255, 0, 0), FILLED);
+			circle(cameraFeed, beamEnd, 6, Scalar(255, 0, 0), FILLED);
+			Point2f beamVec = beamEnd - beamStart;
+			double beamLen = norm(beamVec);
+			Point2f unit = beamVec * (1.0f / (float)beamLen);
+			Point2f setpointPoint = beamStart + unit * (float)((setpointCm / BEAM_DISTANCE_CM) * beamLen);
+			circle(cameraFeed, setpointPoint, 8, Scalar(0, 255, 255), 2);
+
+			double projectionT = 0.0;
+			Point2f ballPoint((float)x, (float)y);
+			Point2f projected = projectPointToBeam(ballPoint, projectionT);
+			ballPositionCm = projectionT * BEAM_DISTANCE_CM;
+			line(cameraFeed, ballPoint, projected, Scalar(0, 255, 255), 1);
+			putText(cameraFeed, "Beam " + intToString((int)round(beamAngleDeg)) + " deg", Point(10, 80), 1, 1, Scalar(255, 255, 0), 2);
+			putText(cameraFeed, "Ball " + intToString((int)round(ballPositionCm * 10.0) / 10) + " cm", Point(10, 110), 1, 1, Scalar(0, 255, 255), 2);
+			putText(cameraFeed, "Set " + intToString((int)round(setpointCm * 10.0) / 10) + " cm", Point(10, 140), 1, 1, Scalar(0, 255, 255), 2);
+		} else {
+			putText(cameraFeed, "Click two points on the beam. Right click to reset.", Point(10, 80), 1, 1, Scalar(0, 255, 255), 2);
+			ballPositionCm = -1.0;
+		}
+
+		if (serialPort.isOpen()) {
+			if (beamDefined && ballPositionCm >= 0.0) {
+				std::ostringstream payload;
+				payload << "vision:" << fixed << setprecision(2) << ballPositionCm;
+				serialPort.writeLine(payload.str());
+			} else {
+				// send only the vision marker when no ball is detected
+				serialPort.writeLine("vision:-1");
+			}
+
+			// Read any incoming serial lines and append to console buffer
+			vector<string> newLines;
+			if (serialPort.readLines(newLines)) {
+				for (const auto &ln : newLines) {
+					serialLog.push_back(ln);
+					if ((int)serialLog.size() > maxSerialLines) serialLog.pop_front();
+				}
+			}
+		}
+
 		//show frames 
-		imshow(windowName2,threshold);
+		imshow(windowName2,thresholdDisplay);
+		imshow(windowName3,threshold);
 		imshow(windowName,cameraFeed);
 		imshow(windowName1,HSV);
+
+		// Render serial console into the Controls window (trackbars remain attached)
+		Mat controlsMat(400, 420, CV_8UC3, Scalar(40,40,40));
+		int y = 20;
+		// show serial port status at the top
+		string status = "Serial: ";
+		if (serialPortPath.empty()) {
+			status += "(none)";
+		} else {
+			status += serialPortPath;
+			status += serialPort.isOpen() ? " (OPEN)" : " (CLOSED)";
+		}
+		putText(controlsMat, status, Point(8, y), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(200,200,200), 1);
+		y += 18;
+		putText(controlsMat, "Serial Console:", Point(8, y), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(200,200,200), 1);
+		y += 24;
+		int lineIdx = 0;
+		for (auto it = serialLog.rbegin(); it != serialLog.rend() && lineIdx < maxSerialLines; ++it, ++lineIdx) {
+			string t = *it;
+			// shorten long lines
+			if (t.size() > 70) t = t.substr(0, 67) + "...";
+			putText(controlsMat, t, Point(8, y), FONT_HERSHEY_SIMPLEX, 0.45, Scalar(180,255,180), 1);
+			y += 18;
+		}
+		imshow(controlsWindowName, controlsMat);
 		
 
 		//delay 30ms so that screen can refresh.

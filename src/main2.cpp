@@ -527,7 +527,9 @@ void handleSerialCommand()
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    Serial.printf("serial input: %s", cmd);
+    // Print safely: avoid passing Arduino String directly to printf (%s expects C string)
+    Serial.print("serial input: ");
+    Serial.println(cmd);
     if (cmd.length() == 0) return;
 
     String cmdLower = cmd;

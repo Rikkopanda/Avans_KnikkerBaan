@@ -516,7 +516,12 @@ double PD_regelaar()
   // Physics-based controller: distance error → ball acceleration
   // Distance error on beam is converted to desired ball acceleration via PID
   // Bereken fout (position error in cm)
-  double controlDistance = (filteredDistance >= 0) ? filteredDistance : distance;
+  double controlDistance = -1.0;
+  if (measurementSource == SOURCE_VISION) {
+    controlDistance = (visionFilteredDistance >= 0) ? visionFilteredDistance : visionDistance;
+  } else {
+    controlDistance = (filteredDistance >= 0) ? filteredDistance : distance;
+  }
   if (controlDistance < 0) {
     return lastPidOutput;
   }
@@ -586,7 +591,9 @@ void handleSerialCommand()
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    Serial.printf("serial input: %s", cmd);
+    // Print safely: avoid passing Arduino String directly to printf (%s expects C string)
+    Serial.print("serial      input: ");
+    Serial.println(cmd);
     if (cmd.length() == 0) return;
 
     String cmdLower = cmd;
@@ -600,7 +607,10 @@ void handleSerialCommand()
 
     if (cmdLower.startsWith("source:") || cmdLower.startsWith("input:")) {
       int sep = cmd.indexOf(':');
-      String valueStr = cmd.substring(sep + 1);
+      // extract the token after the first colon and before any additional colon (e.g. "vision:-1")
+      String rest = cmd.substring(sep + 1);
+      int sep2 = rest.indexOf(':');
+      String valueStr = (sep2 >= 0) ? rest.substring(0, sep2) : rest;
       valueStr.trim();
       valueStr.toLowerCase();
 
@@ -712,6 +722,9 @@ void handleSerialCommand()
       }
       else if (param == "vision" || param == "ball" || param == "pos") {
         updateExternalVisionDistance(valueStr.toFloat());
+        // Automatically switch to vision input when external vision samples arrive
+        measurementSource = SOURCE_VISION;
+        Serial.println("Measurement source: VISION");
         Serial.printf("Vision distance updated to: %.2f\n", distance);
       }
     }
