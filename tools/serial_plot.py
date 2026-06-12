@@ -93,6 +93,7 @@ class TelemetryBuffer:
         self.volt = collections.deque(maxlen=max_points)
         self.dist = collections.deque(maxlen=max_points)
         self.distf = collections.deque(maxlen=max_points)
+        self.speed = collections.deque(maxlen=max_points)
         self.accel = collections.deque(maxlen=max_points)
         self.err = collections.deque(maxlen=max_points)
         self.integral = collections.deque(maxlen=max_points)
@@ -129,6 +130,7 @@ class TelemetryBuffer:
         self.volt.append(fields.get("Volt", 0.0))
         self.dist.append(fields.get("Dist", 0.0))
         self.distf.append(fields.get("DistF", 0.0))
+        self.speed.append(fields.get("Speed", 0.0))
         self.accel.append(fields.get("Accel", 0.0))
         self.err.append(fields.get("Err", 0.0))
         self.integral.append(fields.get("Int", 0.0))
@@ -250,6 +252,7 @@ def main() -> int:
     lines = {}
     lines["dist"] = build_plot(axes[0], [], [], "Dist", "tab:blue")
     lines["distf"] = build_plot(axes[0], [], [], "DistF", "tab:cyan")
+    lines["speed"] = build_plot(axes[0], [], [], "Speed", "tab:purple")
     lines["accel"] = build_plot(axes[0], [], [], "Accel", "tab:green")
     lines["set"] = build_plot(axes[0], [], [], "Setpoint", "tab:orange", 1.2)
     axes[0].set_ylabel("cm")
@@ -528,6 +531,7 @@ def main() -> int:
             overview_lines = {}
             overview_lines["dist"] = build_plot(overview_ax, [], [], "Dist", "tab:blue")
             overview_lines["distf"] = build_plot(overview_ax, [], [], "DistF", "tab:cyan")
+            overview_lines["speed"] = build_plot(overview_ax, [], [], "Speed", "tab:purple")
             overview_lines["accel"] = build_plot(overview_ax, [], [], "Accel", "tab:green")
             overview_lines["set"] = build_plot(overview_ax, [], [], "Setpoint", "tab:orange", 1.2)
             overview_lines["err"] = build_plot(overview_ax, [], [], "Err", "tab:red")
@@ -575,6 +579,7 @@ def main() -> int:
             x = list(buf.time_s)
             overview_lines["dist"].set_data(x, list(buf.dist))
             overview_lines["distf"].set_data(x, list(buf.distf))
+            overview_lines["speed"].set_data(x, list(buf.speed))
             overview_lines["accel"].set_data(x, list(buf.accel))
             overview_lines["set"].set_data(x, list(buf.setpoint))
 
@@ -817,7 +822,7 @@ def main() -> int:
                 f"Port: {args.port}  Mode: {'MAN' if buf.mode and buf.mode[-1] else 'AUTO'}  "
                 f"Src: {'CV' if buf.source and buf.source[-1] else 'SENSOR'}  "
                 f"Dist: {buf.dist[-1]:.2f}  DistF: {buf.distf[-1]:.2f}  Err: {buf.err[-1]:.2f}  "
-                f"Servo: {buf.servo[-1]:.1f}"
+                f"Speed: {buf.speed[-1]:.2f}  Servo: {buf.servo[-1]:.1f}"
             )
             gains_text.set_text(
                 f"Set: {buf.setpoint[-1]:.2f} | Kp: {buf.kp[-1]:.2f} | Ki: {buf.ki[-1]:.3f} | Kd: {buf.kd[-1]:.2f} | "

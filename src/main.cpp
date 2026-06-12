@@ -70,6 +70,7 @@ double pid_p = 0.0;
 double pid_i = 0.0;
 double pid_d = 0.0;
 double pid_deriv_cm_s = 0.0;
+double measuredSpeed_cm_s = 0.0;
 
 double SERVO_NEUTRAL_DEG = 84.0;
 double SERVO_TRAVEL_LIMIT_DEG = 30.0;
@@ -205,12 +206,12 @@ double integral = 0;  // Accumulated error integral in meter*seconds
 // - If response is sluggish: increase Kp or Ki
 // - Physics naturally filters: gravity provides restoring force on tilted beam
 double Kp = 8.0;    // (m/s²) per meter of position error — reduced to avoid overshoot
-double Ki = 0.005;  // Small integral, avoid windup
-double Kd = 4.0;    // Strong derivative to damp oscillation
+double Ki = 0.001;  // Small integral, avoid windup
+double Kd = 12.0;    // Strong derivative to damp oscillation
 double distance;
 double rawDistance;
 double filteredDistance = -1.0;
-double setpoint = 10.0;  // cm from sensor to ball CENTER (mid-beam is a good starting point)
+double setpoint = 16.0;  // cm from sensor to ball CENTER (mid-beam is a good starting point)
 double output;  // PID controller output
 double error;   // Current error for display
 int sensorRaw;
@@ -258,16 +259,18 @@ const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger t
 double PID_DERIVATIVE_ALPHA = 0.7;  // Stronger filter to reduce derivative spikes
 double PID_OUTPUT_ALPHA = 0.5;      // Moderate output smoothing
 
-double PID_ERROR_DEADBAND_CM = 0.30;
+double PID_ERROR_DEADBAND_CM = 0.3;
 
 double SERVO_FILTER_ALPHA = 0.15;   // Slightly more responsive filter
 double SERVO_DEADBAND_DEG = 0.8;    // Tighter deadband for more precise control
 double SERVO_RATE_LIMIT_DEG = 0.5;  // Smaller per-loop step to reduce high-frequency twitching
 double BEAM_BREAKAWAY_DEG = 0.35;   // Minimum beam tilt needed to overcome static friction
+const unsigned long BREAKAWAY_HOLD_MS = 800;
+const unsigned long BREAKAWAY_RAMP_MS = 1800;
 // Settle deadband: only zero the output when BOTH error AND derivative are truly tiny.
 // Keep these small — a 0.8cm settle window was freezing the servo with 1cm of error.
-double SETTLE_ERROR_DEADBAND_CM = 0.35;   // settle in a small window near setpoint
-double SETTLE_DERIVATIVE_DEADBAND = 0.60; // cm/s threshold for "nearly stopped"
+double SETTLE_ERROR_DEADBAND_CM = 0.65;   // settle in a small window near setpoint
+double SETTLE_DERIVATIVE_DEADBAND = 0.006; // cm/s threshold for "nearly stopped"
 const int SERVO_WRITE_MIN_STEP_DEG = 1;
 // Calibrated from user measurements:
 // 5.4 cm printed -> 4.0 cm actual
@@ -285,6 +288,7 @@ unsigned long savedControlCount = 0;
 unsigned long telemetryIntervalMs = 200;
 unsigned long lastTelemetryMs = 0;
 int lastWrittenServoAngle = (int)SERVO_NEUTRAL_DEG;
+unsigned long ballStillSinceMs = 0;
 
 void updateExternalVisionDistance(double dist)
 {
@@ -556,8 +560,8 @@ double PD_regelaar()
   double measurementDelta = controlDistance - prevControlDistance;
   prevControlDistance = controlDistance;
 
-  double derivative = -measurementDelta / dt;
-  filteredDerivative = PID_DERIVATIVE_ALPHA * filteredDerivative + (1.0 - PID_DERIVATIVE_ALPHA) * derivative;
+  measuredSpeed_cm_s = -measurementDelta / dt;
+  filteredDerivative = PID_DERIVATIVE_ALPHA * filteredDerivative + (1.0 - PID_DERIVATIVE_ALPHA) * measuredSpeed_cm_s;
 
   integral += errorM * dt;
   integral = constrain(integral, -0.5, 0.5);
@@ -768,13 +772,34 @@ void loop()
   desiredBeamAngleDeg = constrain(desiredBeamAngleDeg, -maxBeamTiltDeg(), maxBeamTiltDeg());
 
   // Static friction / stiction compensation:
-  // Only apply a breakaway boost when the ball is already nearly stopped.
-  // That helps it start moving without forcing extra motion while it is rolling.
-  if (fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND &&
-      fabs(error) >= PID_ERROR_DEADBAND_CM &&
+  // Only apply breakaway after the ball has been basically still for a while.
+  // This avoids influencing normal motion and only helps it overcome static friction.
+  bool ballNearlyStill = fabs(measuredSpeed_cm_s) < SETTLE_DERIVATIVE_DEADBAND;
+  if (ballNearlyStill && fabs(error) >= PID_ERROR_DEADBAND_CM) {
+      Serial.printf("ballNearlyStill %d, fabs(measuredSpeed_cm_s) %f\n", ballNearlyStill, fabs(measuredSpeed_cm_s));
+
+    if (ballStillSinceMs == 0) {
+      ballStillSinceMs = currentMillis;
+    }
+  } else {
+    ballStillSinceMs = 0;
+  }
+
+  double activeBreakawayDeg = 0.0;
+  if (ballStillSinceMs != 0) {
+    unsigned long stillMs = currentMillis - ballStillSinceMs;
+    // if (stillMs > BREAKAWAY_HOLD_MS * 4) {
+      double ramp = (double)(stillMs - BREAKAWAY_HOLD_MS) / (double)BREAKAWAY_RAMP_MS;
+      // ramp = constrain(ramp, 0.0, 10.0);
+      activeBreakawayDeg = BEAM_BREAKAWAY_DEG * ramp;
+    // }
+  }
+
+  if (ballNearlyStill && activeBreakawayDeg > 0.0 &&
       fabs(desiredBeamAngleDeg) > 0.0 &&
-      fabs(desiredBeamAngleDeg) < BEAM_BREAKAWAY_DEG) {
-    desiredBeamAngleDeg = copysign(BEAM_BREAKAWAY_DEG, desiredBeamAngleDeg);
+      fabs(desiredBeamAngleDeg) < activeBreakawayDeg) {
+    desiredBeamAngleDeg = copysign(activeBreakawayDeg, desiredBeamAngleDeg);
+    // Serial.printf("activeBreakawayDeg %lf, desiredBeamAngleDeg %lf\n", activeBreakawayDeg, desiredBeamAngleDeg);
   }
 
   output = desiredBeamAngleDeg;
@@ -818,18 +843,22 @@ void loop()
 
   // Do not send tiny corrections that only excite servo backlash/noise.
   double writeThresholdDeg = max((double)SERVO_WRITE_MIN_STEP_DEG, SERVO_DEADBAND_DEG);
-  if (fabs(filteredServoAngle - (double)lastWrittenServoAngle) >= writeThresholdDeg) {
+  if ((fabs(filteredServoAngle - (double)lastWrittenServoAngle) >= writeThresholdDeg) && !(fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND)) {
     controlCount++;
     lastWrittenServoAngle = servoAngle;
     writeServoAngle(servoAngle);
   }
+  if (ballNearlyStill) {
+    Serial.printf("servoAngle %d\n", servoAngle);
+  }
+
 
   if (currentMillis - lastTelemetryMs >= telemetryIntervalMs) {
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
     // Out = beam command in degrees, Servo = actual servo angle in degrees
-    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
-                    manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, error, desiredAccelerationMPS2,
+    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Speed:%.3f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
+                    manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, measuredSpeed_cm_s, error, desiredAccelerationMPS2,
                     pid_p, pid_d, pid_i, pid_deriv_cm_s, output, servoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
   }
 }
