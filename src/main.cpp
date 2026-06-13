@@ -271,6 +271,10 @@ double SERVO_RATE_LIMIT_DEG = 10.5;  // Smaller per-loop step to reduce high-fre
 double BEAM_BREAKAWAY_DEG = 0.35;   // Minimum beam tilt needed to overcome static friction
 const unsigned long BREAKAWAY_HOLD_MS = 800;
 const unsigned long BREAKAWAY_RAMP_MS = 1800;
+double STUCK_SPEED_DEADBAND_CM_S = 0.15; // Speed below this counts as physically stuck for friction help
+double BEAM_DITHER_DEG = 0.12;      // Small same-direction beam wobble to overcome static friction
+double BEAM_DITHER_FREQ_HZ = 1.2;   // Slow enough for an SG90 to follow
+const unsigned long DITHER_HOLD_MS = 300;
 // Settle deadband: only zero the output when BOTH error AND derivative are truly tiny.
 // Keep this below the 0.5cm accuracy target so the controller keeps correcting.
 double SETTLE_ERROR_DEADBAND_CM = 0.35;   // 3.5mm settle window near setpoint
@@ -707,6 +711,18 @@ void handleSerialCommand()
             BEAM_BREAKAWAY_DEG = fmax(0.0, (double)valueStr.toFloat());
             Serial.printf("Breakaway angle updated to: %.2f\n", BEAM_BREAKAWAY_DEG);
           }
+        else if (param == "ditheramp") {
+          BEAM_DITHER_DEG = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("Dither amplitude updated to: %.2f\n", BEAM_DITHER_DEG);
+        }
+        else if (param == "ditherfreq") {
+          BEAM_DITHER_FREQ_HZ = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("Dither frequency updated to: %.2f\n", BEAM_DITHER_FREQ_HZ);
+        }
+        else if (param == "stuckspeed") {
+          STUCK_SPEED_DEADBAND_CM_S = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("Stuck speed deadband updated to: %.3f\n", STUCK_SPEED_DEADBAND_CM_S);
+        }
         else if (param == "servodead") {
           SERVO_DEADBAND_DEG = fmax(0.0, (double)valueStr.toFloat());
           Serial.printf("Servo deadband updated to: %.2f\n", SERVO_DEADBAND_DEG);
@@ -782,9 +798,9 @@ void loop()
     // Static friction / stiction compensation:
     // Only apply breakaway after the ball has been basically still for a while.
     // This avoids influencing normal motion and only helps it overcome static friction.
-    bool ballNearlyStill = fabs(measuredSpeed_cm_s) < SETTLE_DERIVATIVE_DEADBAND;
+    bool ballNearlyStill = fabs(filteredDerivative) < STUCK_SPEED_DEADBAND_CM_S;
     if (ballNearlyStill && fabs(error) >= PID_ERROR_DEADBAND_CM) {
-      if (DEBUG) Serial.printf("ballNearlyStill %d, fabs(measuredSpeed_cm_s) %f\n", ballNearlyStill, fabs(measuredSpeed_cm_s));
+      if (DEBUG) Serial.printf("ballNearlyStill %d, fabs(filteredDerivative) %f\n", ballNearlyStill, fabs(filteredDerivative));
 
       if (ballStillSinceMs == 0) {
         ballStillSinceMs = currentMillis;
@@ -793,6 +809,7 @@ void loop()
       ballStillSinceMs = 0;
     }
 
+    bool frictionAssistActive = false;
     double activeBreakawayDeg = 0.0;
     if (ballStillSinceMs != 0) {
       unsigned long stillMs = currentMillis - ballStillSinceMs;
@@ -807,7 +824,19 @@ void loop()
         fabs(desiredBeamAngleDeg) > 0.0 &&
         fabs(desiredBeamAngleDeg) < activeBreakawayDeg) {
       desiredBeamAngleDeg = copysign(activeBreakawayDeg, desiredBeamAngleDeg);
+      frictionAssistActive = true;
       // Serial.printf("activeBreakawayDeg %lf, desiredBeamAngleDeg %lf\n", activeBreakawayDeg, desiredBeamAngleDeg);
+    }
+
+    if (ballNearlyStill && ballStillSinceMs != 0 && BEAM_DITHER_DEG > 0.0 && BEAM_DITHER_FREQ_HZ > 0.0 &&
+        fabs(error) >= PID_ERROR_DEADBAND_CM &&
+        (currentMillis - ballStillSinceMs) > DITHER_HOLD_MS &&
+        fabs(desiredBeamAngleDeg) > 0.0) {
+      double t = (double)currentMillis / 1000.0;
+      double dither = BEAM_DITHER_DEG * (0.5 + 0.5 * sin(2.0 * M_PI * BEAM_DITHER_FREQ_HZ * t));
+      desiredBeamAngleDeg += copysign(dither, desiredBeamAngleDeg);
+      desiredBeamAngleDeg = constrain(desiredBeamAngleDeg, -maxBeamTiltDeg(), maxBeamTiltDeg());
+      frictionAssistActive = true;
     }
 
     output = desiredBeamAngleDeg;
@@ -837,7 +866,7 @@ void loop()
     // Do not send tiny corrections that only excite servo backlash/noise.
     double writeThresholdDeg = max(SERVO_WRITE_MIN_STEP_DEG, SERVO_DEADBAND_DEG);
     if ((fabs(filteredServoAngle - lastWrittenServoAngle) >= writeThresholdDeg) &&
-        !(fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(measuredSpeed_cm_s) < SETTLE_DERIVATIVE_DEADBAND)) {
+        (frictionAssistActive || !(fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(measuredSpeed_cm_s) < SETTLE_DERIVATIVE_DEADBAND))) {
       controlCount++;
       lastWrittenServoAngle = filteredServoAngle;
       writeServoAngle(filteredServoAngle);
@@ -868,8 +897,8 @@ void loop()
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
     // Out = beam command in degrees, Servo = actual servo angle in degrees
-    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Speed:%.3f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
+    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Speed:%.3f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,DitherAmp:%.2f,DitherFreq:%.2f,StuckSpeed:%.3f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
                     manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, measuredSpeed_cm_s, error, desiredAccelerationMPS2,
-                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
+                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, BEAM_DITHER_DEG, BEAM_DITHER_FREQ_HZ, STUCK_SPEED_DEADBAND_CM_S, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
   }
 }

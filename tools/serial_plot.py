@@ -115,6 +115,9 @@ class TelemetryBuffer:
         self.servo_filt = collections.deque(maxlen=max_points)
         self.servo_rate = collections.deque(maxlen=max_points)
         self.breakaway = collections.deque(maxlen=max_points)
+        self.dither_amp = collections.deque(maxlen=max_points)
+        self.dither_freq = collections.deque(maxlen=max_points)
+        self.stuck_speed = collections.deque(maxlen=max_points)
         self.servo_dead = collections.deque(maxlen=max_points)
         self.loopcount = collections.deque(maxlen=max_points)
         self.adc_count = collections.deque(maxlen=max_points)
@@ -152,6 +155,9 @@ class TelemetryBuffer:
         self.servo_filt.append(fields.get("ServoFilt", 0.0))
         self.servo_rate.append(fields.get("ServoRate", 0.0))
         self.breakaway.append(fields.get("Breakaway", 0.0))
+        self.dither_amp.append(fields.get("DitherAmp", 0.0))
+        self.dither_freq.append(fields.get("DitherFreq", 0.0))
+        self.stuck_speed.append(fields.get("StuckSpeed", 0.0))
         self.servo_dead.append(fields.get("ServoDead", 0.0))
         self.loopcount.append(fields.get("LoopCount", 0.0))
         self.adc_count.append(fields.get("ADC", 0.0))
@@ -313,6 +319,9 @@ def main() -> int:
             "servofilt": ("α", "Servo angle smoothing filter alpha (0-1). Higher = more responsive."),
             "servorate": ("°/cycle", "Servo rate limiter. Maximum angle change per control cycle."),
             "breakaway": ("°", "Minimum beam angle used only when the ball is nearly stationary, to overcome static friction."),
+            "ditheramp": ("°", "Small same-direction beam wobble added only while the ball appears stuck."),
+            "ditherfreq": ("Hz", "Frequency of the stuck-ball dither wobble."),
+            "stuckspeed": ("cm/s", "Filtered speed threshold below which the ball is treated as stuck."),
             "servodead": ("°", "Servo deadband. Minimum change before sending a new servo command. Higher reduces chatter; lower reacts sooner."),
         }
 
@@ -329,8 +338,11 @@ def main() -> int:
             ("settleerr", "SetErr", 0.0, 2.0, 0.6, 0.01, "%.2f", "settleerr"),
             ("settlederiv", "SetDer", 0.0, 0.50, 0.08, 0.001, "%.3f", "settlederiv"),
             ("servofilt", "SrvFlt", 0.0, 1.0, 0.08, 0.01, "%.2f", "servofilter"),
-            ("servorate", "SrvRate", 0.05, 5.0, 0.35, 0.05, "%.2f", "servorate"),
+            ("servorate", "SrvRate", 0.05, 15.0, 10.5, 0.05, "%.2f", "servorate"),
             ("breakaway", "BrkAw", 0.0, 3.0, 0.35, 0.01, "%.2f", "breakaway"),
+            ("ditheramp", "DithAmp", 0.0, 1.0, 0.12, 0.01, "%.2f", "ditheramp"),
+            ("ditherfreq", "DithHz", 0.0, 5.0, 1.2, 0.1, "%.1f", "ditherfreq"),
+            ("stuckspeed", "StuckSp", 0.0, 1.0, 0.15, 0.01, "%.2f", "stuckspeed"),
             ("servodead", "SrvDead", 0.0, 5.0, 1.50, 0.05, "%.2f", "servodead"),
         ]
 
@@ -609,6 +621,7 @@ def main() -> int:
                     f"PidDead={buf.pid_dead[-1]:.2f}  SettleErr={buf.settle_err[-1]:.2f}  "
                     f"SettleDeriv={buf.settle_deriv[-1]:.3f}  ServoFilt={buf.servo_filt[-1]:.3f}  "
                     f"ServoRate={buf.servo_rate[-1]:.2f}  Breakaway={buf.breakaway[-1]:.2f}  "
+                    f"Dither={buf.dither_amp[-1]:.2f}@{buf.dither_freq[-1]:.1f}Hz  StuckSp={buf.stuck_speed[-1]:.2f}  "
                     f"ServoDead={buf.servo_dead[-1]:.2f}"
                 )
 
@@ -636,6 +649,9 @@ def main() -> int:
         sliders["servofilt"].on_changed(lambda value: send_from_slider("servofilter", value, "{:.2f}"))
         sliders["servorate"].on_changed(lambda value: send_from_slider("servorate", value, "{:.2f}"))
         sliders["breakaway"].on_changed(lambda value: send_from_slider("breakaway", value, "{:.2f}"))
+        sliders["ditheramp"].on_changed(lambda value: send_from_slider("ditheramp", value, "{:.2f}"))
+        sliders["ditherfreq"].on_changed(lambda value: send_from_slider("ditherfreq", value, "{:.1f}"))
+        sliders["stuckspeed"].on_changed(lambda value: send_from_slider("stuckspeed", value, "{:.2f}"))
         sliders["servodead"].on_changed(lambda value: send_from_slider("servodead", value, "{:.2f}"))
 
         def toggle_controls(_event):
@@ -814,6 +830,9 @@ def main() -> int:
                     sliders["servofilt"].set_val(buf.servo_filt[-1])
                     sliders["servorate"].set_val(buf.servo_rate[-1])
                     sliders["breakaway"].set_val(buf.breakaway[-1])
+                    sliders["ditheramp"].set_val(buf.dither_amp[-1])
+                    sliders["ditherfreq"].set_val(buf.dither_freq[-1])
+                    sliders["stuckspeed"].set_val(buf.stuck_speed[-1])
                     sliders["servodead"].set_val(buf.servo_dead[-1])
                 finally:
                     slider_guard["enabled"] = True
