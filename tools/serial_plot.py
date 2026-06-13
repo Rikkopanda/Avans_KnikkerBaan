@@ -135,6 +135,20 @@ class TelemetryBuffer:
         self.pid_filter_on = collections.deque(maxlen=max_points)
         self.servo_filter_on = collections.deque(maxlen=max_points)
         self.servo_dead = collections.deque(maxlen=max_points)
+        self.sample_ms = collections.deque(maxlen=max_points)
+        self.dist_alpha = collections.deque(maxlen=max_points)
+        self.speed_alpha = collections.deque(maxlen=max_points)
+        self.int_limit = collections.deque(maxlen=max_points)
+        self.max_accel = collections.deque(maxlen=max_points)
+        self.mass = collections.deque(maxlen=max_points)
+        self.gravity = collections.deque(maxlen=max_points)
+        self.roll_factor = collections.deque(maxlen=max_points)
+        self.friction = collections.deque(maxlen=max_points)
+        self.friction_blend = collections.deque(maxlen=max_points)
+        self.beam_gain = collections.deque(maxlen=max_points)
+        self.cal_scale = collections.deque(maxlen=max_points)
+        self.cal_offset = collections.deque(maxlen=max_points)
+        self.ball_radius = collections.deque(maxlen=max_points)
         self.loopcount = collections.deque(maxlen=max_points)
         self.adc_count = collections.deque(maxlen=max_points)
         self.control_count = collections.deque(maxlen=max_points)
@@ -190,6 +204,20 @@ class TelemetryBuffer:
         self.pid_filter_on.append(fields.get("PidFiltOn", 1.0))
         self.servo_filter_on.append(fields.get("ServoFiltOn", 1.0))
         self.servo_dead.append(fields.get("ServoDead", 0.0))
+        self.sample_ms.append(fields.get("SampleMs", 1.0))
+        self.dist_alpha.append(fields.get("DistAlpha", 0.25))
+        self.speed_alpha.append(fields.get("SpeedAlpha", 0.18))
+        self.int_limit.append(fields.get("IntLimit", 12.0))
+        self.max_accel.append(fields.get("MaxAccel", 1.5))
+        self.mass.append(fields.get("Mass", 0.0455))
+        self.gravity.append(fields.get("Gravity", 9.81))
+        self.roll_factor.append(fields.get("RollFactor", 1.4))
+        self.friction.append(fields.get("Friction", 0.003))
+        self.friction_blend.append(fields.get("FrictionBlend", 0.03))
+        self.beam_gain.append(fields.get("BeamGain", 0.114))
+        self.cal_scale.append(fields.get("CalScale", 1.0))
+        self.cal_offset.append(fields.get("CalOffset", 0.0))
+        self.ball_radius.append(fields.get("BallRadius", 1.0))
         self.loopcount.append(fields.get("LoopCount", 0.0))
         self.adc_count.append(fields.get("ADC", 0.0))
         self.control_count.append(fields.get("Control", 0.0))
@@ -361,51 +389,49 @@ def main() -> int:
             "neutral": ("°", "Servo neutral angle at zero beam tilt. Default 84°."),
             "travel": ("°", "Maximum servo travel range in each direction from neutral."),
             "dir": ("±1", "Control direction. 1=forward, -1=reverse. Flips command sign."),
-            "piddead": ("cm", "PID error deadband. When the ball is nearly stopped, errors smaller than this are treated as zero."),
-            "settleerr": ("cm", "Settle zone error threshold. Below this with low derivative, output goes to zero."),
-            "settlederiv": ("cm/s", "Settle zone derivative threshold. Prevents hunting near setpoint."),
-            "servofilt": ("α", "Servo angle smoothing filter alpha (0-1). Higher = more responsive."),
+            "distalpha": ("0-1", "Distance filter new-sample weight. Higher reacts faster; lower removes more sensor noise."),
+            "speedalpha": ("0-1", "Speed filter new-sample weight used by the D term."),
+            "intlimit": ("cm s", "Integral clamp. Limits windup while retaining enough authority to remove steady offset."),
+            "maxaccel": ("m/s²", "Maximum acceleration the PID may request from the motion model."),
             "servorate": ("°/cycle", "Servo rate limiter. Maximum angle change per control cycle."),
-            "breakaway": ("°", "Minimum beam angle used only when the ball is nearly stationary, to overcome static friction."),
-            "ditheramp": ("°", "Small same-direction beam wobble added only while the ball appears stuck."),
-            "ditherfreq": ("Hz", "Frequency of the stuck-ball dither wobble."),
-            "stuckspeed": ("cm/s", "Filtered speed threshold below which the ball is treated as stuck."),
-            "stuckband": ("cm", "Recent filtered-position range below which the ball is treated as stuck."),
-            "ditheron": ("0/1", "Enable or disable stuck-ball dither."),
-            "breakon": ("0/1", "Enable or disable breakaway compensation."),
-            "distfilteron": ("0/1", "Enable or disable distance low-pass filtering."),
-            "derivfilteron": ("0/1", "Enable or disable derivative-speed filtering."),
-            "pidfilteron": ("0/1", "Enable or disable PID output smoothing."),
-            "servofilteron": ("0/1", "Enable or disable servo target smoothing and rate limiting."),
             "servodead": ("°", "Servo deadband. Minimum change before sending a new servo command. Higher reduces chatter; lower reacts sooner."),
+            "samplems": ("ms", "ADC sample interval. Samples are collected continuously; PID still runs at a stable 50 Hz."),
+            "mass": ("kg", "Ball mass. It affects the force needed to overcome friction."),
+            "gravity": ("m/s²", "Gravity used by the rolling-ball motion equation."),
+            "rollfactor": ("ratio", "Effective rolling inertia: 1 + I/(m r²). A solid sphere is 1.4."),
+            "friction": ("N", "Estimated rolling/static friction force opposing commanded motion."),
+            "frictionblend": ("m/s²", "Softens friction compensation around zero acceleration to prevent chatter."),
+            "beamgain": ("ratio", "Beam angle divided by servo angle. Geometry estimate is about 0.114."),
+            "calscale": ("ratio", "Distance calibration scale."),
+            "caloffset": ("cm", "Distance calibration offset."),
+            "ballradius": ("cm", "Added sensor-to-surface correction so control uses the ball center."),
         }
 
         slider_specs = [
-            ("setpoint", "Set", 0.0, 30.0, 5.0, 0.1, "%.2f", "set"),
-            ("kp", "Kp", 0.0, 50.0, 10.0, 0.1, "%.2f", "kp"),
-            ("ki", "Ki", 0.0, 5.0, 0.010, 0.001, "%.3f", "ki"),
-            ("kd", "Kd", 0.0, 20.0, 2.0, 0.1, "%.2f", "kd"),
-            ("servo", "Angle", 54.0, 114.0, 84.0, 1.0, "%.0f", "angle"),
-            ("neutral", "Neutral", 0.0, 180.0, 84.0, 1.0, "%.0f", "neutral"),
-            ("travel", "Travel", 1.0, 60.0, 30.0, 1.0, "%.0f", "travel"),
+            ("setpoint", "Set", 0.0, 30.0, 16.0, 0.1, "%.2f", "set"),
+            ("kp", "Kp", 0.0, 20.0, 2.2, 0.05, "%.2f", "kp"),
+            ("ki", "Ki", 0.0, 10.0, 0.35, 0.01, "%.2f", "ki"),
+            ("kd", "Kd", 0.0, 10.0, 1.2, 0.05, "%.2f", "kd"),
+            ("servo", "Angle", 54.0, 114.0, 84.0, 0.1, "%.1f", "angle"),
+            ("neutral", "Neutral", 0.0, 180.0, 84.0, 0.1, "%.1f", "neutral"),
+            ("travel", "Travel", 1.0, 60.0, 25.0, 0.5, "%.1f", "travel"),
             ("dir", "Dir", -1.0, 1.0, -1.0, 2.0, "%.0f", "dir"),
-            ("piddead", "PidDead", 0.0, 2.0, 0.20, 0.01, "%.2f", "piddead"),
-            ("settleerr", "SetErr", 0.0, 2.0, 0.6, 0.01, "%.2f", "settleerr"),
-            ("settlederiv", "SetDer", 0.0, 0.50, 0.08, 0.001, "%.3f", "settlederiv"),
-            ("servofilt", "SrvFlt", 0.0, 1.0, 0.08, 0.01, "%.2f", "servofilter"),
-            ("servorate", "SrvRate", 0.05, 15.0, 10.5, 0.05, "%.2f", "servorate"),
-            ("breakaway", "BrkAw", 0.0, 3.0, 0.35, 0.01, "%.2f", "breakaway"),
-            ("ditheramp", "DithAmp", 0.0, 2.0, 0.12, 0.01, "%.2f", "ditheramp"),
-            ("ditherfreq", "DithHz", 0.0, 5.0, 1.2, 0.1, "%.1f", "ditherfreq"),
-            ("stuckspeed", "StuckSp", 0.0, 10.0, 1.0, 0.05, "%.2f", "stuckspeed"),
-            ("stuckband", "StuckBd", 0.0, 0.8, 0.25, 0.01, "%.2f", "stuckband"),
-            ("ditheron", "DithOn", 0.0, 1.0, 1.0, 1.0, "%.0f", "ditheron"),
-            ("breakon", "BrkOn", 0.0, 1.0, 1.0, 1.0, "%.0f", "breakon"),
-            ("distfilteron", "DistFOn", 0.0, 1.0, 1.0, 1.0, "%.0f", "distfilteron"),
-            ("derivfilteron", "DerivOn", 0.0, 1.0, 1.0, 1.0, "%.0f", "derivfilteron"),
-            ("pidfilteron", "PidFOn", 0.0, 1.0, 1.0, 1.0, "%.0f", "pidfilteron"),
-            ("servofilteron", "SrvFOn", 0.0, 1.0, 1.0, 1.0, "%.0f", "servofilteron"),
-            ("servodead", "SrvDead", 0.0, 5.0, 1.50, 0.05, "%.2f", "servodead"),
+            ("distalpha", "DistAlpha", 0.01, 1.0, 0.25, 0.01, "%.2f", "distalpha"),
+            ("speedalpha", "SpeedAlpha", 0.01, 1.0, 0.18, 0.01, "%.2f", "speedalpha"),
+            ("intlimit", "IntLimit", 0.0, 50.0, 12.0, 0.5, "%.1f", "intlimit"),
+            ("maxaccel", "MaxAccel", 0.05, 5.0, 1.5, 0.05, "%.2f", "maxaccel"),
+            ("servorate", "SrvRate", 0.01, 10.0, 1.2, 0.01, "%.2f", "servorate"),
+            ("servodead", "SrvDead", 0.0, 2.0, 0.02, 0.01, "%.2f", "servodead"),
+            ("samplems", "SampleMs", 0.25, 20.0, 1.0, 0.25, "%.2f", "samplems"),
+            ("mass", "Mass", 0.001, 0.5, 0.0455, 0.001, "%.3f", "mass"),
+            ("gravity", "Gravity", 1.0, 15.0, 9.81, 0.01, "%.2f", "gravity"),
+            ("rollfactor", "RollFactor", 1.0, 3.0, 1.4, 0.05, "%.2f", "rollfactor"),
+            ("friction", "Friction", 0.0, 0.1, 0.003, 0.0005, "%.4f", "friction"),
+            ("frictionblend", "FricBlend", 0.001, 0.5, 0.03, 0.005, "%.3f", "frictionblend"),
+            ("beamgain", "BeamGain", 0.01, 0.5, 0.114, 0.001, "%.3f", "beamgain"),
+            ("calscale", "CalScale", 0.5, 1.5, 1.01695, 0.001, "%.3f", "calscale"),
+            ("caloffset", "CalOffset", -10.0, 10.0, -1.492, 0.01, "%.2f", "caloffset"),
+            ("ballradius", "BallRadius", 0.0, 3.0, 1.0, 0.05, "%.2f", "ballradius"),
         ]
 
         slider_axes = {}
@@ -720,27 +746,26 @@ def main() -> int:
         sliders["kp"].on_changed(lambda value: send_from_slider("kp", value, "{:.2f}"))
         sliders["ki"].on_changed(lambda value: send_from_slider("ki", value, "{:.3f}"))
         sliders["kd"].on_changed(lambda value: send_from_slider("kd", value, "{:.2f}"))
-        sliders["servo"].on_changed(lambda value: send_from_slider("angle", value, "{:.0f}"))
-        sliders["neutral"].on_changed(lambda value: send_from_slider("neutral", value, "{:.0f}"))
-        sliders["travel"].on_changed(lambda value: send_from_slider("travel", value, "{:.0f}"))
+        sliders["servo"].on_changed(lambda value: send_from_slider("angle", value, "{:.1f}"))
+        sliders["neutral"].on_changed(lambda value: send_from_slider("neutral", value, "{:.1f}"))
+        sliders["travel"].on_changed(lambda value: send_from_slider("travel", value, "{:.1f}"))
         sliders["dir"].on_changed(lambda value: send_from_slider("dir", value, "{:.0f}"))
-        sliders["piddead"].on_changed(lambda value: send_from_slider("piddead", value, "{:.2f}"))
-        sliders["settleerr"].on_changed(lambda value: send_from_slider("settleerr", value, "{:.2f}"))
-        sliders["settlederiv"].on_changed(lambda value: send_from_slider("settlederiv", value, "{:.3f}"))
-        sliders["servofilt"].on_changed(lambda value: send_from_slider("servofilter", value, "{:.2f}"))
+        sliders["distalpha"].on_changed(lambda value: send_from_slider("distalpha", value, "{:.2f}"))
+        sliders["speedalpha"].on_changed(lambda value: send_from_slider("speedalpha", value, "{:.2f}"))
+        sliders["intlimit"].on_changed(lambda value: send_from_slider("intlimit", value, "{:.1f}"))
+        sliders["maxaccel"].on_changed(lambda value: send_from_slider("maxaccel", value, "{:.2f}"))
         sliders["servorate"].on_changed(lambda value: send_from_slider("servorate", value, "{:.2f}"))
-        sliders["breakaway"].on_changed(lambda value: send_from_slider("breakaway", value, "{:.2f}"))
-        sliders["ditheramp"].on_changed(lambda value: send_from_slider("ditheramp", value, "{:.2f}"))
-        sliders["ditherfreq"].on_changed(lambda value: send_from_slider("ditherfreq", value, "{:.1f}"))
-        sliders["stuckspeed"].on_changed(lambda value: send_from_slider("stuckspeed", value, "{:.2f}"))
-        sliders["stuckband"].on_changed(lambda value: send_from_slider("stuckband", value, "{:.2f}"))
-        sliders["ditheron"].on_changed(lambda value: send_from_slider("ditheron", value, "{:.0f}"))
-        sliders["breakon"].on_changed(lambda value: send_from_slider("breakon", value, "{:.0f}"))
-        sliders["distfilteron"].on_changed(lambda value: send_from_slider("distfilteron", value, "{:.0f}"))
-        sliders["derivfilteron"].on_changed(lambda value: send_from_slider("derivfilteron", value, "{:.0f}"))
-        sliders["pidfilteron"].on_changed(lambda value: send_from_slider("pidfilteron", value, "{:.0f}"))
-        sliders["servofilteron"].on_changed(lambda value: send_from_slider("servofilteron", value, "{:.0f}"))
         sliders["servodead"].on_changed(lambda value: send_from_slider("servodead", value, "{:.2f}"))
+        sliders["samplems"].on_changed(lambda value: send_from_slider("samplems", value, "{:.2f}"))
+        sliders["mass"].on_changed(lambda value: send_from_slider("mass", value, "{:.4f}"))
+        sliders["gravity"].on_changed(lambda value: send_from_slider("gravity", value, "{:.3f}"))
+        sliders["rollfactor"].on_changed(lambda value: send_from_slider("rollfactor", value, "{:.3f}"))
+        sliders["friction"].on_changed(lambda value: send_from_slider("friction", value, "{:.5f}"))
+        sliders["frictionblend"].on_changed(lambda value: send_from_slider("frictionblend", value, "{:.3f}"))
+        sliders["beamgain"].on_changed(lambda value: send_from_slider("beamgain", value, "{:.4f}"))
+        sliders["calscale"].on_changed(lambda value: send_from_slider("calscale", value, "{:.5f}"))
+        sliders["caloffset"].on_changed(lambda value: send_from_slider("caloffset", value, "{:.3f}"))
+        sliders["ballradius"].on_changed(lambda value: send_from_slider("ballradius", value, "{:.2f}"))
 
         def toggle_controls(_event):
             new_state = not controls_visible["value"]
@@ -921,23 +946,22 @@ def main() -> int:
                     sliders["neutral"].set_val(buf.neutral[-1])
                     sliders["travel"].set_val(buf.travel[-1])
                     sliders["dir"].set_val(buf.direction[-1])
-                    sliders["piddead"].set_val(buf.pid_dead[-1])
-                    sliders["settleerr"].set_val(buf.settle_err[-1])
-                    sliders["settlederiv"].set_val(buf.settle_deriv[-1])
-                    sliders["servofilt"].set_val(buf.servo_filt[-1])
+                    sliders["distalpha"].set_val(buf.dist_alpha[-1])
+                    sliders["speedalpha"].set_val(buf.speed_alpha[-1])
+                    sliders["intlimit"].set_val(buf.int_limit[-1])
+                    sliders["maxaccel"].set_val(buf.max_accel[-1])
                     sliders["servorate"].set_val(buf.servo_rate[-1])
-                    sliders["breakaway"].set_val(buf.breakaway[-1])
-                    sliders["ditheramp"].set_val(buf.dither_amp[-1])
-                    sliders["ditherfreq"].set_val(buf.dither_freq[-1])
-                    sliders["stuckspeed"].set_val(buf.stuck_speed[-1])
-                    sliders["stuckband"].set_val(buf.stuck_band[-1])
-                    sliders["ditheron"].set_val(buf.dither_on[-1])
-                    sliders["breakon"].set_val(buf.break_on[-1])
-                    sliders["distfilteron"].set_val(buf.dist_filter_on[-1])
-                    sliders["derivfilteron"].set_val(buf.deriv_filter_on[-1])
-                    sliders["pidfilteron"].set_val(buf.pid_filter_on[-1])
-                    sliders["servofilteron"].set_val(buf.servo_filter_on[-1])
                     sliders["servodead"].set_val(buf.servo_dead[-1])
+                    sliders["samplems"].set_val(buf.sample_ms[-1])
+                    sliders["mass"].set_val(buf.mass[-1])
+                    sliders["gravity"].set_val(buf.gravity[-1])
+                    sliders["rollfactor"].set_val(buf.roll_factor[-1])
+                    sliders["friction"].set_val(buf.friction[-1])
+                    sliders["frictionblend"].set_val(buf.friction_blend[-1])
+                    sliders["beamgain"].set_val(buf.beam_gain[-1])
+                    sliders["calscale"].set_val(buf.cal_scale[-1])
+                    sliders["caloffset"].set_val(buf.cal_offset[-1])
+                    sliders["ballradius"].set_val(buf.ball_radius[-1])
                 finally:
                     slider_guard["enabled"] = True
 
