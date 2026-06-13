@@ -118,6 +118,12 @@ class TelemetryBuffer:
         self.dither_amp = collections.deque(maxlen=max_points)
         self.dither_freq = collections.deque(maxlen=max_points)
         self.stuck_speed = collections.deque(maxlen=max_points)
+        self.stuck_band = collections.deque(maxlen=max_points)
+        self.static = collections.deque(maxlen=max_points)
+        self.settle_active = collections.deque(maxlen=max_points)
+        self.breakaway_active = collections.deque(maxlen=max_points)
+        self.dither_active = collections.deque(maxlen=max_points)
+        self.friction_active = collections.deque(maxlen=max_points)
         self.servo_dead = collections.deque(maxlen=max_points)
         self.loopcount = collections.deque(maxlen=max_points)
         self.adc_count = collections.deque(maxlen=max_points)
@@ -158,6 +164,12 @@ class TelemetryBuffer:
         self.dither_amp.append(fields.get("DitherAmp", 0.0))
         self.dither_freq.append(fields.get("DitherFreq", 0.0))
         self.stuck_speed.append(fields.get("StuckSpeed", 0.0))
+        self.stuck_band.append(fields.get("StuckBand", 0.0))
+        self.static.append(fields.get("Static", 0.0))
+        self.settle_active.append(fields.get("Settle", 0.0))
+        self.breakaway_active.append(fields.get("BreakAct", 0.0))
+        self.dither_active.append(fields.get("DitherAct", 0.0))
+        self.friction_active.append(fields.get("Friction", 0.0))
         self.servo_dead.append(fields.get("ServoDead", 0.0))
         self.loopcount.append(fields.get("LoopCount", 0.0))
         self.adc_count.append(fields.get("ADC", 0.0))
@@ -285,7 +297,12 @@ def main() -> int:
     apply_limits(axes[2], None if args.auto_scale else args.out_lim)
 
     lines["volt"] = build_plot(axes[3], [], [], "Volt", "tab:gray")
-    axes[3].set_ylabel("V")
+    lines["static"] = build_plot(axes[3], [], [], "Static", "tab:blue", 1.2)
+    lines["settle_active"] = build_plot(axes[3], [], [], "Settle", "tab:green", 1.2)
+    lines["dither_active"] = build_plot(axes[3], [], [], "Dither", "tab:red", 1.4)
+    lines["breakaway_active"] = build_plot(axes[3], [], [], "Break", "tab:orange", 1.2)
+    lines["friction_active"] = build_plot(axes[3], [], [], "Friction", "tab:purple", 1.2)
+    axes[3].set_ylabel("V / state")
     axes[3].set_xlabel("time (s)")
     axes[3].legend(loc="upper right")
     axes[3].grid(True, alpha=0.25)
@@ -322,6 +339,7 @@ def main() -> int:
             "ditheramp": ("°", "Small same-direction beam wobble added only while the ball appears stuck."),
             "ditherfreq": ("Hz", "Frequency of the stuck-ball dither wobble."),
             "stuckspeed": ("cm/s", "Filtered speed threshold below which the ball is treated as stuck."),
+            "stuckband": ("cm", "Recent filtered-position range below which the ball is treated as stuck."),
             "servodead": ("°", "Servo deadband. Minimum change before sending a new servo command. Higher reduces chatter; lower reacts sooner."),
         }
 
@@ -343,6 +361,7 @@ def main() -> int:
             ("ditheramp", "DithAmp", 0.0, 1.0, 0.12, 0.01, "%.2f", "ditheramp"),
             ("ditherfreq", "DithHz", 0.0, 5.0, 1.2, 0.1, "%.1f", "ditherfreq"),
             ("stuckspeed", "StuckSp", 0.0, 1.0, 0.15, 0.01, "%.2f", "stuckspeed"),
+            ("stuckband", "StuckBd", 0.0, 0.5, 0.12, 0.01, "%.2f", "stuckband"),
             ("servodead", "SrvDead", 0.0, 5.0, 1.50, 0.05, "%.2f", "servodead"),
         ]
 
@@ -559,6 +578,11 @@ def main() -> int:
             overview_lines["loopcount"] = build_plot(overview_ax, [], [], "Loop/s", "tab:orange")
             overview_lines["adc_count"] = build_plot(overview_ax, [], [], "ADC/s", "tab:red")
             overview_lines["control_count"] = build_plot(overview_ax, [], [], "Ctrl/s", "tab:olive")
+            overview_lines["static"] = build_plot(overview_ax, [], [], "Static", "black", 1.2)
+            overview_lines["settle_active"] = build_plot(overview_ax, [], [], "Settle", "tab:green", 1.2)
+            overview_lines["dither_active"] = build_plot(overview_ax, [], [], "Dither", "tab:red", 1.4)
+            overview_lines["breakaway_active"] = build_plot(overview_ax, [], [], "Break", "tab:orange", 1.2)
+            overview_lines["friction_active"] = build_plot(overview_ax, [], [], "Friction", "tab:purple", 1.2)
 
             overview_ax.set_ylabel("mixed units")
             overview_ax.set_xlabel("time (s)")
@@ -611,6 +635,11 @@ def main() -> int:
             overview_lines["loopcount"].set_data(x, list(buf.loopcount))
             overview_lines["adc_count"].set_data(x, list(buf.adc_count))
             overview_lines["control_count"].set_data(x, list(buf.control_count))
+            overview_lines["static"].set_data(x, [0.4 + 0.20 * value for value in buf.static])
+            overview_lines["settle_active"].set_data(x, [0.8 + 0.20 * value for value in buf.settle_active])
+            overview_lines["dither_active"].set_data(x, [1.2 + 0.20 * value for value in buf.dither_active])
+            overview_lines["breakaway_active"].set_data(x, [1.6 + 0.20 * value for value in buf.breakaway_active])
+            overview_lines["friction_active"].set_data(x, [2.0 + 0.20 * value for value in buf.friction_active])
 
             overview_axis.relim()
             overview_axis.autoscale_view()
@@ -621,8 +650,12 @@ def main() -> int:
                     f"PidDead={buf.pid_dead[-1]:.2f}  SettleErr={buf.settle_err[-1]:.2f}  "
                     f"SettleDeriv={buf.settle_deriv[-1]:.3f}  ServoFilt={buf.servo_filt[-1]:.3f}  "
                     f"ServoRate={buf.servo_rate[-1]:.2f}  Breakaway={buf.breakaway[-1]:.2f}  "
-                    f"Dither={buf.dither_amp[-1]:.2f}@{buf.dither_freq[-1]:.1f}Hz  StuckSp={buf.stuck_speed[-1]:.2f}  "
-                    f"ServoDead={buf.servo_dead[-1]:.2f}"
+                    f"Dither={buf.dither_amp[-1]:.2f}@{buf.dither_freq[-1]:.1f}Hz  "
+                    f"Stuck={buf.stuck_speed[-1]:.2f}/{buf.stuck_band[-1]:.2f}  "
+                    f"ServoDead={buf.servo_dead[-1]:.2f}  "
+                    f"Static={int(buf.static[-1])} Settle={int(buf.settle_active[-1])} "
+                    f"DitherAct={int(buf.dither_active[-1])} BreakAct={int(buf.breakaway_active[-1])} "
+                    f"Friction={int(buf.friction_active[-1])}"
                 )
 
             overview_fig.canvas.draw_idle()
@@ -652,6 +685,7 @@ def main() -> int:
         sliders["ditheramp"].on_changed(lambda value: send_from_slider("ditheramp", value, "{:.2f}"))
         sliders["ditherfreq"].on_changed(lambda value: send_from_slider("ditherfreq", value, "{:.1f}"))
         sliders["stuckspeed"].on_changed(lambda value: send_from_slider("stuckspeed", value, "{:.2f}"))
+        sliders["stuckband"].on_changed(lambda value: send_from_slider("stuckband", value, "{:.2f}"))
         sliders["servodead"].on_changed(lambda value: send_from_slider("servodead", value, "{:.2f}"))
 
         def toggle_controls(_event):
@@ -806,6 +840,11 @@ def main() -> int:
         lines["dout"].set_data(x, list(buf.dout))
         lines["iout"].set_data(x, list(buf.iout))
         lines["volt"].set_data(x, list(buf.volt))
+        lines["static"].set_data(x, [0.4 + 0.20 * value for value in buf.static])
+        lines["settle_active"].set_data(x, [0.8 + 0.20 * value for value in buf.settle_active])
+        lines["dither_active"].set_data(x, [1.2 + 0.20 * value for value in buf.dither_active])
+        lines["breakaway_active"].set_data(x, [1.6 + 0.20 * value for value in buf.breakaway_active])
+        lines["friction_active"].set_data(x, [2.0 + 0.20 * value for value in buf.friction_active])
 
         # Always autoscale to show data
         for ax in axes:
@@ -833,6 +872,7 @@ def main() -> int:
                     sliders["ditheramp"].set_val(buf.dither_amp[-1])
                     sliders["ditherfreq"].set_val(buf.dither_freq[-1])
                     sliders["stuckspeed"].set_val(buf.stuck_speed[-1])
+                    sliders["stuckband"].set_val(buf.stuck_band[-1])
                     sliders["servodead"].set_val(buf.servo_dead[-1])
                 finally:
                     slider_guard["enabled"] = True
@@ -841,11 +881,14 @@ def main() -> int:
                 f"Port: {args.port}  Mode: {'MAN' if buf.mode and buf.mode[-1] else 'AUTO'}  "
                 f"Src: {'CV' if buf.source and buf.source[-1] else 'SENSOR'}  "
                 f"Dist: {buf.dist[-1]:.2f}  DistF: {buf.distf[-1]:.2f}  Err: {buf.err[-1]:.2f}  "
-                f"Speed: {buf.speed[-1]:.2f}  Servo: {buf.servo[-1]:.1f}"
+                f"Speed: {buf.speed[-1]:.2f}  Servo: {buf.servo[-1]:.1f}  "
+                f"Static:{int(buf.static[-1])} Settle:{int(buf.settle_active[-1])} "
+                f"Dither:{int(buf.dither_active[-1])} Break:{int(buf.breakaway_active[-1])}"
             )
             gains_text.set_text(
                 f"Set: {buf.setpoint[-1]:.2f} | Kp: {buf.kp[-1]:.2f} | Ki: {buf.ki[-1]:.3f} | Kd: {buf.kd[-1]:.2f} | "
-                f"Neutral: {buf.neutral[-1]:.0f} | Travel: {buf.travel[-1]:.0f} | Dir: {buf.direction[-1]:.0f} | Out: {buf.output[-1]:.1f}"
+                f"Neutral: {buf.neutral[-1]:.0f} | Travel: {buf.travel[-1]:.0f} | Dir: {buf.direction[-1]:.0f} | "
+                f"Out: {buf.output[-1]:.1f} | Friction:{int(buf.friction_active[-1])}"
             )
             loopcount_text.set_text(
                 f"Loop/s: {int(buf.loopcount[-1])} | ADC/s: {int(buf.adc_count[-1])} | Ctrl/s: {int(buf.control_count[-1])}"

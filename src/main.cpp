@@ -275,6 +275,11 @@ double STUCK_SPEED_DEADBAND_CM_S = 0.15; // Speed below this counts as physicall
 double BEAM_DITHER_DEG = 0.12;      // Small same-direction beam wobble to overcome static friction
 double BEAM_DITHER_FREQ_HZ = 1.2;   // Slow enough for an SG90 to follow
 const unsigned long DITHER_HOLD_MS = 300;
+const int STUCK_HISTORY_SIZE = 15;  // 15 samples at 50Hz = 300ms stability window
+double STUCK_POSITION_BAND_CM = 0.25; // Max recent position range to consider the ball physically stuck
+const int STUCK_CONFIDENCE_ENTER = 6;
+const int STUCK_CONFIDENCE_EXIT = 2;
+const int STUCK_CONFIDENCE_MAX = 12;
 // Settle deadband: only zero the output when BOTH error AND derivative are truly tiny.
 // Keep this below the 0.5cm accuracy target so the controller keeps correcting.
 double SETTLE_ERROR_DEADBAND_CM = 0.35;   // 3.5mm settle window near setpoint
@@ -297,6 +302,15 @@ unsigned long telemetryIntervalMs = 200;
 unsigned long lastTelemetryMs = 0;
 double lastWrittenServoAngle = SERVO_NEUTRAL_DEG;
 unsigned long ballStillSinceMs = 0;
+double stuckPositionHistory[STUCK_HISTORY_SIZE];
+int stuckHistoryIndex = 0;
+bool stuckHistoryFilled = false;
+int stuckConfidence = 0;
+bool telemetryBallStatic = false;
+bool telemetrySettleActive = false;
+bool telemetryBreakawayActive = false;
+bool telemetryDitherActive = false;
+bool telemetryFrictionAssistActive = false;
 
 void updateExternalVisionDistance(double dist)
 {
@@ -606,6 +620,41 @@ double PD_regelaar()
   return constrain(lastPidOutput, -1.0, 1.0);  // m/s²
 }
 
+bool updateBallStuckDetector(double controlDistance)
+{
+  if (controlDistance < 0) {
+    stuckHistoryIndex = 0;
+    stuckHistoryFilled = false;
+    return false;
+  }
+
+  stuckPositionHistory[stuckHistoryIndex] = controlDistance;
+  stuckHistoryIndex++;
+  if (stuckHistoryIndex >= STUCK_HISTORY_SIZE) {
+    stuckHistoryIndex = 0;
+    stuckHistoryFilled = true;
+  }
+
+  int sampleCount = stuckHistoryFilled ? STUCK_HISTORY_SIZE : stuckHistoryIndex;
+  if (sampleCount < STUCK_HISTORY_SIZE) {
+    return false;
+  }
+
+  double minPos = stuckPositionHistory[0];
+  double maxPos = stuckPositionHistory[0];
+  for (int i = 1; i < STUCK_HISTORY_SIZE; i++) {
+    minPos = fmin(minPos, stuckPositionHistory[i]);
+    maxPos = fmax(maxPos, stuckPositionHistory[i]);
+  }
+
+  double positionRange = maxPos - minPos;
+  double averageSpeedMagnitude = fabs((stuckPositionHistory[(stuckHistoryIndex + STUCK_HISTORY_SIZE - 1) % STUCK_HISTORY_SIZE] -
+                                       stuckPositionHistory[stuckHistoryIndex]) /
+                                      ((STUCK_HISTORY_SIZE - 1) * (CONTROL_INTERVAL_US / 1000000.0)));
+
+  return positionRange <= STUCK_POSITION_BAND_CM && averageSpeedMagnitude <= STUCK_SPEED_DEADBAND_CM_S;
+}
+
 void handleSerialCommand()
 {
   if (Serial.available()) {
@@ -723,6 +772,10 @@ void handleSerialCommand()
           STUCK_SPEED_DEADBAND_CM_S = fmax(0.0, (double)valueStr.toFloat());
           Serial.printf("Stuck speed deadband updated to: %.3f\n", STUCK_SPEED_DEADBAND_CM_S);
         }
+        else if (param == "stuckband") {
+          STUCK_POSITION_BAND_CM = fmax(0.0, (double)valueStr.toFloat());
+          Serial.printf("Stuck position band updated to: %.3f\n", STUCK_POSITION_BAND_CM);
+        }
         else if (param == "servodead") {
           SERVO_DEADBAND_DEG = fmax(0.0, (double)valueStr.toFloat());
           Serial.printf("Servo deadband updated to: %.2f\n", SERVO_DEADBAND_DEG);
@@ -798,9 +851,22 @@ void loop()
     // Static friction / stiction compensation:
     // Only apply breakaway after the ball has been basically still for a while.
     // This avoids influencing normal motion and only helps it overcome static friction.
-    bool ballNearlyStill = fabs(filteredDerivative) < STUCK_SPEED_DEADBAND_CM_S;
+    double stuckControlDistance = -1.0;
+    if (measurementSource == SOURCE_VISION) {
+      stuckControlDistance = (visionFilteredDistance >= 0) ? visionFilteredDistance : visionDistance;
+    } else {
+      stuckControlDistance = (filteredDistance >= 0) ? filteredDistance : distance;
+    }
+
+    bool ballNearlyStill = updateBallStuckDetector(stuckControlDistance);
+    telemetryBallStatic = ballNearlyStill;
+    telemetrySettleActive = fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(measuredSpeed_cm_s) < SETTLE_DERIVATIVE_DEADBAND;
+    telemetryBreakawayActive = false;
+    telemetryDitherActive = false;
+    telemetryFrictionAssistActive = false;
+
     if (ballNearlyStill && fabs(error) >= PID_ERROR_DEADBAND_CM) {
-      if (DEBUG) Serial.printf("ballNearlyStill %d, fabs(filteredDerivative) %f\n", ballNearlyStill, fabs(filteredDerivative));
+      if (DEBUG) Serial.printf("ballNearlyStill %d, stuckControlDistance %f\n", ballNearlyStill, stuckControlDistance);
 
       if (ballStillSinceMs == 0) {
         ballStillSinceMs = currentMillis;
@@ -825,6 +891,7 @@ void loop()
         fabs(desiredBeamAngleDeg) < activeBreakawayDeg) {
       desiredBeamAngleDeg = copysign(activeBreakawayDeg, desiredBeamAngleDeg);
       frictionAssistActive = true;
+      telemetryBreakawayActive = true;
       // Serial.printf("activeBreakawayDeg %lf, desiredBeamAngleDeg %lf\n", activeBreakawayDeg, desiredBeamAngleDeg);
     }
 
@@ -837,7 +904,10 @@ void loop()
       desiredBeamAngleDeg += copysign(dither, desiredBeamAngleDeg);
       desiredBeamAngleDeg = constrain(desiredBeamAngleDeg, -maxBeamTiltDeg(), maxBeamTiltDeg());
       frictionAssistActive = true;
+      telemetryDitherActive = true;
     }
+
+    telemetryFrictionAssistActive = frictionAssistActive;
 
     output = desiredBeamAngleDeg;
 
@@ -897,8 +967,8 @@ void loop()
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
     // Out = beam command in degrees, Servo = actual servo angle in degrees
-    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Speed:%.3f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,DitherAmp:%.2f,DitherFreq:%.2f,StuckSpeed:%.3f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
+    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Speed:%.3f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,DitherAmp:%.2f,DitherFreq:%.2f,StuckSpeed:%.3f,StuckBand:%.3f,Static:%d,Settle:%d,BreakAct:%d,DitherAct:%d,Friction:%d,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
                     manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, measuredSpeed_cm_s, error, desiredAccelerationMPS2,
-                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, BEAM_DITHER_DEG, BEAM_DITHER_FREQ_HZ, STUCK_SPEED_DEADBAND_CM_S, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
+                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, BEAM_DITHER_DEG, BEAM_DITHER_FREQ_HZ, STUCK_SPEED_DEADBAND_CM_S, STUCK_POSITION_BAND_CM, telemetryBallStatic ? 1 : 0, telemetrySettleActive ? 1 : 0, telemetryBreakawayActive ? 1 : 0, telemetryDitherActive ? 1 : 0, telemetryFrictionAssistActive ? 1 : 0, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
   }
 }
