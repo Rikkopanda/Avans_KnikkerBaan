@@ -17,6 +17,8 @@ const int MAX7219_DIN_PIN = 23;
 const int MAX7219_CLK_PIN = 18;
 const int MAX7219_CS_PIN = 5;
 
+#define DEBUG 0
+
 // ===== SENSOR SELECTION =====
 // Uncomment one of the following to select sensor type:
 // #define USE_HC_SR04        // HC-SR04 ultrasonic sensor
@@ -269,9 +271,9 @@ const unsigned long BREAKAWAY_HOLD_MS = 800;
 const unsigned long BREAKAWAY_RAMP_MS = 1800;
 // Settle deadband: only zero the output when BOTH error AND derivative are truly tiny.
 // Keep these small — a 0.8cm settle window was freezing the servo with 1cm of error.
-double SETTLE_ERROR_DEADBAND_CM = 0.65;   // settle in a small window near setpoint
-double SETTLE_DERIVATIVE_DEADBAND = 0.006; // cm/s threshold for "nearly stopped"
-const int SERVO_WRITE_MIN_STEP_DEG = 1;
+double SETTLE_ERROR_DEADBAND_CM = 1;   // settle in a small window near setpoint
+double SETTLE_DERIVATIVE_DEADBAND = 0.008; // cm/s threshold for "nearly stopped"
+const int SERVO_WRITE_MIN_STEP_DEG = 0;
 // Calibrated from user measurements:
 // 5.4 cm printed -> 4.0 cm actual
 // 11.3 cm printed -> 10.0 cm actual
@@ -776,7 +778,7 @@ void loop()
   // This avoids influencing normal motion and only helps it overcome static friction.
   bool ballNearlyStill = fabs(measuredSpeed_cm_s) < SETTLE_DERIVATIVE_DEADBAND;
   if (ballNearlyStill && fabs(error) >= PID_ERROR_DEADBAND_CM) {
-      Serial.printf("ballNearlyStill %d, fabs(measuredSpeed_cm_s) %f\n", ballNearlyStill, fabs(measuredSpeed_cm_s));
+      if (DEBUG) Serial.printf("ballNearlyStill %d, fabs(measuredSpeed_cm_s) %f\n", ballNearlyStill, fabs(measuredSpeed_cm_s));
 
     if (ballStillSinceMs == 0) {
       ballStillSinceMs = currentMillis;
@@ -843,13 +845,20 @@ void loop()
 
   // Do not send tiny corrections that only excite servo backlash/noise.
   double writeThresholdDeg = max((double)SERVO_WRITE_MIN_STEP_DEG, SERVO_DEADBAND_DEG);
-  if ((fabs(filteredServoAngle - (double)lastWrittenServoAngle) >= writeThresholdDeg) && !(fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(filteredDerivative) < SETTLE_DERIVATIVE_DEADBAND)) {
+  if ((fabs(filteredServoAngle - (double)lastWrittenServoAngle) >= writeThresholdDeg) && !(fabs(error) < SETTLE_ERROR_DEADBAND_CM && fabs(measuredSpeed_cm_s) < SETTLE_DERIVATIVE_DEADBAND)) {
     controlCount++;
     lastWrittenServoAngle = servoAngle;
     writeServoAngle(servoAngle);
+    if (DEBUG) Serial.printf("writeServoAngle\t%f\t%f\n",fabs(error), fabs(measuredSpeed_cm_s));
+
+  }
+  else
+  {
+    if (DEBUG) Serial.printf("NOT writeServoAngle\t%f\t%f\n",fabs(error), fabs(measuredSpeed_cm_s));
+
   }
   if (ballNearlyStill) {
-    Serial.printf("servoAngle %d\n", servoAngle);
+    if (DEBUG) Serial.printf("servoAngle %d\n", servoAngle);
   }
 
 
