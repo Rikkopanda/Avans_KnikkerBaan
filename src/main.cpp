@@ -249,7 +249,7 @@ uint16_t adcBuffer[MEDIAN_SIZE];
 int adcIndex = 0;
 bool adcFilled = false;
 
-const double DISTANCE_FILTER_ALPHA = 0.10;
+const double DISTANCE_FILTER_ALPHA = 0.02;
 
 // ===== moving average + spike rejection =====
 const int MOVING_AVG_SIZE = 8; // simple moving average window
@@ -262,6 +262,10 @@ const double SPIKE_DISTANCE_THRESHOLD = 3.0; // cm, ignore sudden jumps larger t
 
 double PID_DERIVATIVE_ALPHA = 0.7;  // Stronger filter to reduce derivative spikes
 double PID_OUTPUT_ALPHA = 0.5;      // Moderate output smoothing
+bool ENABLE_DISTANCE_FILTER = true;
+bool ENABLE_DERIVATIVE_FILTER = true;
+bool ENABLE_PID_OUTPUT_FILTER = true;
+bool ENABLE_SERVO_FILTER = true;
 
 double PID_ERROR_DEADBAND_CM = 0.15; // 1.5mm: reject tiny sensor noise without hiding 5mm errors
 
@@ -269,11 +273,13 @@ double SERVO_FILTER_ALPHA = 0.15;   // Slightly more responsive filter
 double SERVO_DEADBAND_DEG = 0.25;   // Small write threshold; keep corrections below the 5mm target visible
 double SERVO_RATE_LIMIT_DEG = 10.5;  // Smaller per-loop step to reduce high-frequency twitching
 double BEAM_BREAKAWAY_DEG = 0.35;   // Minimum beam tilt needed to overcome static friction
+bool ENABLE_BREAKAWAY = true;
 const unsigned long BREAKAWAY_HOLD_MS = 800;
 const unsigned long BREAKAWAY_RAMP_MS = 1800;
-double STUCK_SPEED_DEADBAND_CM_S = 0.15; // Speed below this counts as physically stuck for friction help
+double STUCK_SPEED_DEADBAND_CM_S = 1.0; // Window-average speed below this counts as physically stuck
 double BEAM_DITHER_DEG = 0.12;      // Small same-direction beam wobble to overcome static friction
 double BEAM_DITHER_FREQ_HZ = 1.2;   // Slow enough for an SG90 to follow
+bool ENABLE_DITHER = true;
 const unsigned long DITHER_HOLD_MS = 300;
 const int STUCK_HISTORY_SIZE = 15;  // 15 samples at 50Hz = 300ms stability window
 double STUCK_POSITION_BAND_CM = 0.25; // Max recent position range to consider the ball physically stuck
@@ -311,6 +317,9 @@ bool telemetrySettleActive = false;
 bool telemetryBreakawayActive = false;
 bool telemetryDitherActive = false;
 bool telemetryFrictionAssistActive = false;
+double telemetryBreakawayDeg = 0.0;
+double telemetryDitherDeg = 0.0;
+double telemetryStuckAverageSpeedCmS = 0.0;
 
 void updateExternalVisionDistance(double dist)
 {
@@ -325,7 +334,7 @@ void updateExternalVisionDistance(double dist)
   }
 
   distance = dist;
-  if (visionFilteredDistance < 0) {
+  if (visionFilteredDistance < 0 || !ENABLE_DISTANCE_FILTER) {
     visionFilteredDistance = dist;
   } else {
     visionFilteredDistance = VISION_FILTER_ALPHA * dist + (1.0 - VISION_FILTER_ALPHA) * visionFilteredDistance;
@@ -521,6 +530,10 @@ void leesSensorEnPot()
       {
         filteredDistance = distance;
       }
+      else if (!ENABLE_DISTANCE_FILTER)
+      {
+        filteredDistance = distance;
+      }
       else
       {
         filteredDistance = DISTANCE_FILTER_ALPHA * distance + (1.0 - DISTANCE_FILTER_ALPHA) * filteredDistance;
@@ -583,7 +596,11 @@ double PD_regelaar()
   prevControlDistance = controlDistance;
 
   measuredSpeed_cm_s = -measurementDelta / dt;
-  filteredDerivative = PID_DERIVATIVE_ALPHA * filteredDerivative + (1.0 - PID_DERIVATIVE_ALPHA) * measuredSpeed_cm_s;
+  if (ENABLE_DERIVATIVE_FILTER) {
+    filteredDerivative = PID_DERIVATIVE_ALPHA * filteredDerivative + (1.0 - PID_DERIVATIVE_ALPHA) * measuredSpeed_cm_s;
+  } else {
+    filteredDerivative = measuredSpeed_cm_s;
+  }
 
   integral += errorM * dt;
   integral = constrain(integral, -0.5, 0.5);
@@ -614,7 +631,11 @@ double PD_regelaar()
   // Multiplying rawOutput by 0.35 near the setpoint was suppressing the
   // derivative term right where damping matters most, causing oscillation.
 
-  lastPidOutput = PID_OUTPUT_ALPHA * lastPidOutput + (1.0 - PID_OUTPUT_ALPHA) * rawOutput;
+  if (ENABLE_PID_OUTPUT_FILTER) {
+    lastPidOutput = PID_OUTPUT_ALPHA * lastPidOutput + (1.0 - PID_OUTPUT_ALPHA) * rawOutput;
+  } else {
+    lastPidOutput = rawOutput;
+  }
   
   // Limit acceleration command (±2 m/s² reasonable for 5.5g ball)
   return constrain(lastPidOutput, -1.0, 1.0);  // m/s²
@@ -625,6 +646,8 @@ bool updateBallStuckDetector(double controlDistance)
   if (controlDistance < 0) {
     stuckHistoryIndex = 0;
     stuckHistoryFilled = false;
+    stuckConfidence = 0;
+    telemetryStuckAverageSpeedCmS = 0.0;
     return false;
   }
 
@@ -637,6 +660,7 @@ bool updateBallStuckDetector(double controlDistance)
 
   int sampleCount = stuckHistoryFilled ? STUCK_HISTORY_SIZE : stuckHistoryIndex;
   if (sampleCount < STUCK_HISTORY_SIZE) {
+    telemetryStuckAverageSpeedCmS = 0.0;
     return false;
   }
 
@@ -648,11 +672,23 @@ bool updateBallStuckDetector(double controlDistance)
   }
 
   double positionRange = maxPos - minPos;
-  double averageSpeedMagnitude = fabs((stuckPositionHistory[(stuckHistoryIndex + STUCK_HISTORY_SIZE - 1) % STUCK_HISTORY_SIZE] -
-                                       stuckPositionHistory[stuckHistoryIndex]) /
-                                      ((STUCK_HISTORY_SIZE - 1) * (CONTROL_INTERVAL_US / 1000000.0)));
+  bool positionStable = positionRange <= STUCK_POSITION_BAND_CM;
+  int oldestIndex = stuckHistoryIndex;
+  int newestIndex = (stuckHistoryIndex + STUCK_HISTORY_SIZE - 1) % STUCK_HISTORY_SIZE;
+  telemetryStuckAverageSpeedCmS = (stuckPositionHistory[newestIndex] - stuckPositionHistory[oldestIndex]) /
+                                  ((STUCK_HISTORY_SIZE - 1) * (CONTROL_INTERVAL_US / 1000000.0));
+  bool averageSpeedStable = fabs(telemetryStuckAverageSpeedCmS) <= STUCK_SPEED_DEADBAND_CM_S;
 
-  return positionRange <= STUCK_POSITION_BAND_CM && averageSpeedMagnitude <= STUCK_SPEED_DEADBAND_CM_S;
+  if (positionStable && averageSpeedStable) {
+    stuckConfidence = min(STUCK_CONFIDENCE_MAX, stuckConfidence + 2);
+  } else {
+    stuckConfidence = max(0, stuckConfidence - 1);
+  }
+
+  if (telemetryBallStatic) {
+    return stuckConfidence > STUCK_CONFIDENCE_EXIT;
+  }
+  return stuckConfidence >= STUCK_CONFIDENCE_ENTER;
 }
 
 void handleSerialCommand()
@@ -776,6 +812,30 @@ void handleSerialCommand()
           STUCK_POSITION_BAND_CM = fmax(0.0, (double)valueStr.toFloat());
           Serial.printf("Stuck position band updated to: %.3f\n", STUCK_POSITION_BAND_CM);
         }
+        else if (param == "ditheron") {
+          ENABLE_DITHER = valueStr.toFloat() >= 0.5;
+          Serial.printf("Dither enabled: %d\n", ENABLE_DITHER ? 1 : 0);
+        }
+        else if (param == "breakon") {
+          ENABLE_BREAKAWAY = valueStr.toFloat() >= 0.5;
+          Serial.printf("Breakaway enabled: %d\n", ENABLE_BREAKAWAY ? 1 : 0);
+        }
+        else if (param == "distfilteron") {
+          ENABLE_DISTANCE_FILTER = valueStr.toFloat() >= 0.5;
+          Serial.printf("Distance filter enabled: %d\n", ENABLE_DISTANCE_FILTER ? 1 : 0);
+        }
+        else if (param == "derivfilteron") {
+          ENABLE_DERIVATIVE_FILTER = valueStr.toFloat() >= 0.5;
+          Serial.printf("Derivative filter enabled: %d\n", ENABLE_DERIVATIVE_FILTER ? 1 : 0);
+        }
+        else if (param == "pidfilteron") {
+          ENABLE_PID_OUTPUT_FILTER = valueStr.toFloat() >= 0.5;
+          Serial.printf("PID output filter enabled: %d\n", ENABLE_PID_OUTPUT_FILTER ? 1 : 0);
+        }
+        else if (param == "servofilteron") {
+          ENABLE_SERVO_FILTER = valueStr.toFloat() >= 0.5;
+          Serial.printf("Servo filter enabled: %d\n", ENABLE_SERVO_FILTER ? 1 : 0);
+        }
         else if (param == "servodead") {
           SERVO_DEADBAND_DEG = fmax(0.0, (double)valueStr.toFloat());
           Serial.printf("Servo deadband updated to: %.2f\n", SERVO_DEADBAND_DEG);
@@ -864,6 +924,8 @@ void loop()
     telemetryBreakawayActive = false;
     telemetryDitherActive = false;
     telemetryFrictionAssistActive = false;
+    telemetryBreakawayDeg = 0.0;
+    telemetryDitherDeg = 0.0;
 
     if (ballNearlyStill && fabs(error) >= PID_ERROR_DEADBAND_CM) {
       if (DEBUG) Serial.printf("ballNearlyStill %d, stuckControlDistance %f\n", ballNearlyStill, stuckControlDistance);
@@ -877,7 +939,7 @@ void loop()
 
     bool frictionAssistActive = false;
     double activeBreakawayDeg = 0.0;
-    if (ballStillSinceMs != 0) {
+    if (ENABLE_BREAKAWAY && ballStillSinceMs != 0) {
       unsigned long stillMs = currentMillis - ballStillSinceMs;
       if (stillMs > BREAKAWAY_HOLD_MS) {
         double ramp = (double)(stillMs - BREAKAWAY_HOLD_MS) / (double)BREAKAWAY_RAMP_MS;
@@ -889,22 +951,27 @@ void loop()
     if (ballNearlyStill && activeBreakawayDeg > 0.0 &&
         fabs(desiredBeamAngleDeg) > 0.0 &&
         fabs(desiredBeamAngleDeg) < activeBreakawayDeg) {
+      double beforeBreakawayDeg = desiredBeamAngleDeg;
       desiredBeamAngleDeg = copysign(activeBreakawayDeg, desiredBeamAngleDeg);
       frictionAssistActive = true;
       telemetryBreakawayActive = true;
+      telemetryBreakawayDeg = desiredBeamAngleDeg - beforeBreakawayDeg;
       // Serial.printf("activeBreakawayDeg %lf, desiredBeamAngleDeg %lf\n", activeBreakawayDeg, desiredBeamAngleDeg);
     }
 
-    if (ballNearlyStill && ballStillSinceMs != 0 && BEAM_DITHER_DEG > 0.0 && BEAM_DITHER_FREQ_HZ > 0.0 &&
+    if (ENABLE_DITHER && ballNearlyStill && ballStillSinceMs != 0 && BEAM_DITHER_DEG > 0.0 && BEAM_DITHER_FREQ_HZ > 0.0 &&
         fabs(error) >= PID_ERROR_DEADBAND_CM &&
         (currentMillis - ballStillSinceMs) > DITHER_HOLD_MS &&
         fabs(desiredBeamAngleDeg) > 0.0) {
       double t = (double)currentMillis / 1000.0;
       double dither = BEAM_DITHER_DEG * (0.5 + 0.5 * sin(2.0 * M_PI * BEAM_DITHER_FREQ_HZ * t));
-      desiredBeamAngleDeg += copysign(dither, desiredBeamAngleDeg);
+      double signedDitherDeg = copysign(dither, desiredBeamAngleDeg);
+      double beforeDitherDeg = desiredBeamAngleDeg;
+      desiredBeamAngleDeg += signedDitherDeg;
       desiredBeamAngleDeg = constrain(desiredBeamAngleDeg, -maxBeamTiltDeg(), maxBeamTiltDeg());
       frictionAssistActive = true;
       telemetryDitherActive = true;
+      telemetryDitherDeg = desiredBeamAngleDeg - beforeDitherDeg;
     }
 
     telemetryFrictionAssistActive = frictionAssistActive;
@@ -926,6 +993,8 @@ void loop()
     if (!filteredServoAngleInitialized) {
       filteredServoAngle = targetServoAngle;
       filteredServoAngleInitialized = true;
+    } else if (!ENABLE_SERVO_FILTER) {
+      filteredServoAngle = constrain(targetServoAngle, servoMinDeg(), servoMaxDeg());
     } else {
       double filteredTarget = SERVO_FILTER_ALPHA * targetServoAngle + (1.0 - SERVO_FILTER_ALPHA) * filteredServoAngle;
       double maxStep = max(0.05, SERVO_RATE_LIMIT_DEG);
@@ -967,8 +1036,9 @@ void loop()
     lastTelemetryMs = currentMillis;
     // Plot-friendly line: full physics-based control chain
     // Out = beam command in degrees, Servo = actual servo angle in degrees
-    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Speed:%.3f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,DitherAmp:%.2f,DitherFreq:%.2f,StuckSpeed:%.3f,StuckBand:%.3f,Static:%d,Settle:%d,BreakAct:%d,DitherAct:%d,Friction:%d,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
-                    manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, measuredSpeed_cm_s, error, desiredAccelerationMPS2,
-                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, BEAM_DITHER_DEG, BEAM_DITHER_FREQ_HZ, STUCK_SPEED_DEADBAND_CM_S, STUCK_POSITION_BAND_CM, telemetryBallStatic ? 1 : 0, telemetrySettleActive ? 1 : 0, telemetryBreakawayActive ? 1 : 0, telemetryDitherActive ? 1 : 0, telemetryFrictionAssistActive ? 1 : 0, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
+    Serial.printf("Plot,Mode:%d,Src:%d,Set:%.2f,Raw:%d,Volt:%.3f,Dist:%.2f,DistF:%.2f,Speed:%.3f,StuckAvg:%.3f,Err:%.2f,Accel:%.2f,POut:%.3f,DOut:%.3f,IOut:%.3f,Deriv:%.3f,Out:%.2f,Servo:%.2f,Kp:%.2f,Ki:%.3f,Kd:%.2f,Neutral:%.1f,Travel:%.1f,Dir:%.1f,PidDead:%.2f,SettleErr:%.2f,SettleDeriv:%.3f,ServoFilt:%.3f,ServoRate:%.2f,Breakaway:%.2f,DitherAmp:%.2f,DitherFreq:%.2f,StuckSpeed:%.3f,StuckBand:%.3f,DitherOn:%d,BreakOn:%d,DistFiltOn:%d,DerivFiltOn:%d,PidFiltOn:%d,ServoFiltOn:%d,Static:%d,Settle:%d,BreakAct:%d,DitherAct:%d,Friction:%d,BreakDeg:%.3f,DitherDeg:%.3f,ServoDead:%.2f,LoopCount:%lu,ADC:%lu,Control:%lu\n",
+                    manualServoOverride ? 1 : 0, measurementSource == SOURCE_VISION ? 1 : 0, setpoint, sensorRaw, voltage, distance, filteredDistance, measuredSpeed_cm_s,
+                    telemetryStuckAverageSpeedCmS, error, desiredAccelerationMPS2,
+                    pid_p, pid_d, pid_i, pid_deriv_cm_s, output, filteredServoAngle, Kp, Ki, Kd, SERVO_NEUTRAL_DEG, SERVO_TRAVEL_LIMIT_DEG, CONTROL_DIRECTION, PID_ERROR_DEADBAND_CM, SETTLE_ERROR_DEADBAND_CM, SETTLE_DERIVATIVE_DEADBAND, SERVO_FILTER_ALPHA, SERVO_RATE_LIMIT_DEG, BEAM_BREAKAWAY_DEG, BEAM_DITHER_DEG, BEAM_DITHER_FREQ_HZ, STUCK_SPEED_DEADBAND_CM_S, STUCK_POSITION_BAND_CM, ENABLE_DITHER ? 1 : 0, ENABLE_BREAKAWAY ? 1 : 0, ENABLE_DISTANCE_FILTER ? 1 : 0, ENABLE_DERIVATIVE_FILTER ? 1 : 0, ENABLE_PID_OUTPUT_FILTER ? 1 : 0, ENABLE_SERVO_FILTER ? 1 : 0, telemetryBallStatic ? 1 : 0, telemetrySettleActive ? 1 : 0, telemetryBreakawayActive ? 1 : 0, telemetryDitherActive ? 1 : 0, telemetryFrictionAssistActive ? 1 : 0, telemetryBreakawayDeg, telemetryDitherDeg, SERVO_DEADBAND_DEG, savedCount, savedAdcCount, savedControlCount);
   }
 }
