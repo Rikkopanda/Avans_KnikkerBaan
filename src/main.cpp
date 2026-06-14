@@ -52,6 +52,7 @@ bool manualMode = false;
 double manualAngle = 84.0;
 double visionPosition = -1.0;
 unsigned long lastVisionMs = 0;
+constexpr unsigned long VISION_TIMEOUT_MS = 250;
 
 double rawDistance = -1.0;
 double measuredPosition = -1.0;
@@ -167,7 +168,8 @@ int medianAdc()
 double readPosition()
 {
   if (inputSource == VISION) {
-    measuredPosition = (millis() - lastVisionMs <= 500) ? visionPosition : -1.0;
+    measuredPosition = (millis() - lastVisionMs <= VISION_TIMEOUT_MS)
+        ? visionPosition : -1.0;
     return measuredPosition;
   }
 
@@ -191,6 +193,15 @@ void resetController()
   averageSpeed10 = 0.0;
   avaragecnt = 0;
   settleActive = false;
+}
+
+void levelServo()
+{
+  servoAngle += clampValue(servoNeutral - servoAngle, -servoRate, servoRate);
+  if (fabs(servoAngle - writtenServoAngle) >= servoDeadband) {
+    writtenServoAngle = servoAngle;
+    writeServo(servoAngle);
+  }
 }
 
 struct Parameter {
@@ -257,12 +268,17 @@ void handleCommand()
 
   if (name == "source" || name == "input") {
     inputSource = (textValue == "vision" || textValue == "cv" || textValue == "camera") ? VISION : SENSOR;
+    visionPosition = -1.0;
+    measuredPosition = -1.0;
     resetController();
     return;
   }
   if (name == "vision" || name == "ball" || name == "pos") {
+    if (inputSource != VISION) resetController();
     visionPosition = textValue.toFloat();
     lastVisionMs = millis();
+    // A vision sample makes tracking authoritative. The analog sensor remains
+    // disabled until an explicit "source:sensor" command is received.
     inputSource = VISION;
     return;
   }
@@ -288,7 +304,10 @@ void handleCommand()
 void updateControl(double dt)
 {
   double measured = readPosition();
-  if (measured < 0.0) return;
+  if (measured < 0.0) {
+    if (inputSource == VISION) levelServo();
+    return;
+  }
 
   if (position < 0.0) position = measured;
   position += distanceAlpha * (measured - position);
@@ -313,20 +332,12 @@ void updateControl(double dt)
 
     if (settleActive) {
       // Stop applying the previous tilted command while settled.
-      servoAngle += clampValue(servoNeutral - servoAngle, -servoRate, servoRate);
-      if (fabs(servoAngle - writtenServoAngle) >= servoDeadband) {
-        writtenServoAngle = servoAngle;
-        writeServo(servoAngle);
-      }
+      levelServo();
       showDistance(position);
       return;
     }
   } else if (settleActive) {
-    servoAngle += clampValue(servoNeutral - servoAngle, -servoRate, servoRate);
-    if (fabs(servoAngle - writtenServoAngle) >= servoDeadband) {
-      writtenServoAngle = servoAngle;
-      writeServo(servoAngle);
-    }
+    levelServo();
     showDistance(position);
     return;
   }

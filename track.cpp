@@ -28,11 +28,11 @@ using namespace std;
 //initial min and max HSV filter values.
 //these will be changed using trackbars
 int H_MIN = 0;
-int H_MAX = 256;
+int H_MAX = 179;
 int S_MIN = 0;
-int S_MAX = 256;
+int S_MAX = 255;
 int V_MIN = 0;
-int V_MAX = 256;
+int V_MAX = 255;
 //default capture width and height
 const int FRAME_WIDTH = 640;
 const int FRAME_HEIGHT = 480;
@@ -49,22 +49,20 @@ const string windowName3 = "After Morphological Operations";
 const string trackbarWindowName = "Trackbars";
 const string controlsWindowName = "Controls";
 
-const double BEAM_DISTANCE_CM = 30.0;
+double beamDistanceCm = 30.0;
 
-int SETPOINT_TRACKBAR = 150;
-double setpointCm = 15.0;
-int KP_TRACKBAR = 100;
-int KI_TRACKBAR = 5;
-int KD_TRACKBAR = 40;
+int SETPOINT_TRACKBAR = 160;
+double setpointCm = 16.0;
+int KP_TRACKBAR = 30;
+int KI_TRACKBAR = 150;
+int KD_TRACKBAR = 35;
 int SERVO_NEUTRAL_TRACKBAR = 84;
-int SERVO_TRAVEL_TRACKBAR = 30;
+int SERVO_TRAVEL_TRACKBAR = 35;
 int CONTROL_DIRECTION_TRACKBAR = 0;
-int PID_DEADBAND_TRACKBAR = 20;
-int SETTLE_ERROR_TRACKBAR = 20;
-int SETTLE_DERIVATIVE_TRACKBAR = 30;
-int SERVO_FILTER_TRACKBAR = 15;
-int SERVO_RATE_TRACKBAR = 80;
-int SERVO_DEADBAND_TRACKBAR = 8;
+int SETTLE_ERROR_TRACKBAR = 80;
+int SETTLE_DERIVATIVE_TRACKBAR = 50;
+int SERVO_RATE_TRACKBAR = 150;
+int SERVO_DEADBAND_TRACKBAR = 1;
 
 Point2f beamStart(-1.0f, -1.0f);
 Point2f beamEnd(-1.0f, -1.0f);
@@ -125,8 +123,15 @@ public:
 		if (fd_ < 0) {
 			return;
 		}
-		::write(fd_, line.c_str(), line.size());
-		::write(fd_, "\n", 1);
+		string payload = line + "\n";
+		const char *data = payload.data();
+		size_t remaining = payload.size();
+		while (remaining > 0) {
+			ssize_t written = ::write(fd_, data, remaining);
+			if (written <= 0) return;
+			data += written;
+			remaining -= (size_t)written;
+		}
 	}
 
 	// Read available data and extract full lines (without trailing newline).
@@ -197,10 +202,8 @@ void pushCurrentControlState()
 	sendSerialFloat("neutral", SERVO_NEUTRAL_TRACKBAR, 1);
 	sendSerialFloat("travel", SERVO_TRAVEL_TRACKBAR, 1);
 	sendSerialInt("dir", CONTROL_DIRECTION_TRACKBAR ? 1 : -1);
-	sendSerialFloat("piddead", PID_DEADBAND_TRACKBAR / 100.0, 2);
-	sendSerialFloat("settleerr", SETTLE_ERROR_TRACKBAR / 100.0, 2);
-	sendSerialFloat("settlederiv", SETTLE_DERIVATIVE_TRACKBAR / 1000.0, 3);
-	sendSerialFloat("servofilter", SERVO_FILTER_TRACKBAR / 100.0, 2);
+	sendSerialFloat("settleerror", SETTLE_ERROR_TRACKBAR / 100.0, 2);
+	sendSerialFloat("settlespeed", SETTLE_DERIVATIVE_TRACKBAR / 100.0, 2);
 	sendSerialFloat("servorate", SERVO_RATE_TRACKBAR / 100.0, 2);
 	sendSerialFloat("servodead", SERVO_DEADBAND_TRACKBAR / 100.0, 2);
 }
@@ -251,24 +254,14 @@ void on_dir_trackbar(int, void*)
 	sendSerialInt("dir", CONTROL_DIRECTION_TRACKBAR ? 1 : -1);
 }
 
-void on_piddead_trackbar(int, void*)
-{
-	sendSerialFloat("piddead", PID_DEADBAND_TRACKBAR / 100.0, 2);
-}
-
 void on_settleerr_trackbar(int, void*)
 {
-	sendSerialFloat("settleerr", SETTLE_ERROR_TRACKBAR / 100.0, 2);
+	sendSerialFloat("settleerror", SETTLE_ERROR_TRACKBAR / 100.0, 2);
 }
 
 void on_settlederiv_trackbar(int, void*)
 {
-	sendSerialFloat("settlederiv", SETTLE_DERIVATIVE_TRACKBAR / 1000.0, 3);
-}
-
-void on_servofilter_trackbar(int, void*)
-{
-	sendSerialFloat("servofilter", SERVO_FILTER_TRACKBAR / 100.0, 2);
+	sendSerialFloat("settlespeed", SETTLE_DERIVATIVE_TRACKBAR / 100.0, 2);
 }
 
 void on_servorate_trackbar(int, void*)
@@ -349,17 +342,15 @@ void createTrackbars(){
     createTrackbar( "S_MAX", trackbarWindowName, &S_MAX, S_MAX, on_trackbar );
     createTrackbar( "V_MIN", trackbarWindowName, &V_MIN, V_MAX, on_trackbar );
     createTrackbar( "V_MAX", trackbarWindowName, &V_MAX, V_MAX, on_trackbar );
-	createTrackbar( "Setpoint cm", controlsWindowName, &SETPOINT_TRACKBAR, (int)(BEAM_DISTANCE_CM * 10.0), on_setpoint_trackbar );
+	createTrackbar( "Setpoint cm", controlsWindowName, &SETPOINT_TRACKBAR, (int)(beamDistanceCm * 10.0), on_setpoint_trackbar );
 	createTrackbar( "Kp x0.1", controlsWindowName, &KP_TRACKBAR, 500, on_kp_trackbar );
 	createTrackbar( "Ki x0.001", controlsWindowName, &KI_TRACKBAR, 5000, on_ki_trackbar );
 	createTrackbar( "Kd x0.1", controlsWindowName, &KD_TRACKBAR, 200, on_kd_trackbar );
 	createTrackbar( "Neutral", controlsWindowName, &SERVO_NEUTRAL_TRACKBAR, 180, on_neutral_trackbar );
 	createTrackbar( "Travel", controlsWindowName, &SERVO_TRAVEL_TRACKBAR, 60, on_travel_trackbar );
 	createTrackbar( "Dir", controlsWindowName, &CONTROL_DIRECTION_TRACKBAR, 1, on_dir_trackbar );
-	createTrackbar( "PidDead x0.01", controlsWindowName, &PID_DEADBAND_TRACKBAR, 200, on_piddead_trackbar );
 	createTrackbar( "SetErr x0.01", controlsWindowName, &SETTLE_ERROR_TRACKBAR, 200, on_settleerr_trackbar );
-	createTrackbar( "SetDer x0.001", controlsWindowName, &SETTLE_DERIVATIVE_TRACKBAR, 500, on_settlederiv_trackbar );
-	createTrackbar( "SrvFilt x0.01", controlsWindowName, &SERVO_FILTER_TRACKBAR, 100, on_servofilter_trackbar );
+	createTrackbar( "SetSpeed x0.01", controlsWindowName, &SETTLE_DERIVATIVE_TRACKBAR, 500, on_settlederiv_trackbar );
 	createTrackbar( "SrvRate x0.01", controlsWindowName, &SERVO_RATE_TRACKBAR, 500, on_servorate_trackbar );
 	createTrackbar( "SrvDead x0.01", controlsWindowName, &SERVO_DEADBAND_TRACKBAR, 500, on_servodead_trackbar );
 
@@ -410,7 +401,7 @@ void morphOps(Mat &thresh){
 
 
 }
-void trackFilteredObject(int &x, int &y, Mat threshold, Mat &cameraFeed){
+bool trackFilteredObject(int &x, int &y, Mat threshold, Mat &cameraFeed){
 
 	Mat temp;
 	threshold.copyTo(temp);
@@ -440,7 +431,7 @@ void trackFilteredObject(int &x, int &y, Mat threshold, Mat &cameraFeed){
 					y = moment.m01/area;
 					objectFound = true;
 					refArea = area;
-				}else objectFound = false;
+				}
 
 
 			}
@@ -452,17 +443,27 @@ void trackFilteredObject(int &x, int &y, Mat threshold, Mat &cameraFeed){
 
 		}else putText(cameraFeed,"TOO MUCH NOISE! ADJUST FILTER",Point(0,50),1,2,Scalar(0,0,255),2);
 	}
+	return objectFound;
 }
 int main(int argc, char* argv[])
 {
 	string serialPortPath;
 	int serialBaud = 115200;
+	int cameraIndex = 0;
 	for (int i = 1; i < argc; ++i) {
 		string arg = argv[i];
 		if (arg == "--serial" && i + 1 < argc) {
 			serialPortPath = argv[++i];
 		} else if (arg == "--baud" && i + 1 < argc) {
 			serialBaud = atoi(argv[++i]);
+		} else if (arg == "--camera" && i + 1 < argc) {
+			cameraIndex = atoi(argv[++i]);
+		} else if (arg == "--beam-cm" && i + 1 < argc) {
+			beamDistanceCm = atof(argv[++i]);
+		} else if (arg == "--help") {
+			cout << "Usage: ./track [--serial /dev/ttyUSB0] [--baud 115200] "
+			        "[--camera 0] [--beam-cm 30]\n";
+			return 0;
 		}
 	}
 
@@ -492,7 +493,11 @@ int main(int argc, char* argv[])
 	//video capture object to acquire webcam feed
 	VideoCapture capture;
 	//open capture object at location zero (default location for webcam)
-	capture.open(0);
+	capture.open(cameraIndex);
+	if (!capture.isOpened()) {
+		cerr << "Could not open camera " << cameraIndex << endl;
+		return 1;
+	}
 	//set height and width of capture frame
 	capture.set(CAP_PROP_FRAME_WIDTH,FRAME_WIDTH);
 	capture.set(CAP_PROP_FRAME_HEIGHT,FRAME_HEIGHT);
@@ -527,23 +532,23 @@ int main(int argc, char* argv[])
 		//pass in thresholded frame to our object tracking function
 		//this function will return the x and y coordinates of the
 		//filtered object
-		if(trackObjects)
+		bool objectFound = trackObjects &&
 			trackFilteredObject(x,y,threshold,cameraFeed);
 
-		if (beamDefined) {
+		if (beamDefined && objectFound) {
 			line(cameraFeed, beamStart, beamEnd, Scalar(255, 0, 0), 2);
 			circle(cameraFeed, beamStart, 6, Scalar(255, 0, 0), FILLED);
 			circle(cameraFeed, beamEnd, 6, Scalar(255, 0, 0), FILLED);
 			Point2f beamVec = beamEnd - beamStart;
 			double beamLen = norm(beamVec);
 			Point2f unit = beamVec * (1.0f / (float)beamLen);
-			Point2f setpointPoint = beamStart + unit * (float)((setpointCm / BEAM_DISTANCE_CM) * beamLen);
+			Point2f setpointPoint = beamStart + unit * (float)((setpointCm / beamDistanceCm) * beamLen);
 			circle(cameraFeed, setpointPoint, 8, Scalar(0, 255, 255), 2);
 
 			double projectionT = 0.0;
 			Point2f ballPoint((float)x, (float)y);
 			Point2f projected = projectPointToBeam(ballPoint, projectionT);
-			ballPositionCm = projectionT * BEAM_DISTANCE_CM;
+			ballPositionCm = projectionT * beamDistanceCm;
 			line(cameraFeed, ballPoint, projected, Scalar(0, 255, 255), 1);
 			putText(cameraFeed, "Beam " + intToString((int)round(beamAngleDeg)) + " deg", Point(10, 80), 1, 1, Scalar(255, 255, 0), 2);
 			putText(cameraFeed, "Ball " + intToString((int)round(ballPositionCm * 10.0) / 10) + " cm", Point(10, 110), 1, 1, Scalar(0, 255, 255), 2);
@@ -554,7 +559,7 @@ int main(int argc, char* argv[])
 		}
 
 		if (serialPort.isOpen()) {
-			if (beamDefined && ballPositionCm >= 0.0) {
+			if (beamDefined && objectFound && ballPositionCm >= 0.0) {
 				std::ostringstream payload;
 				payload << "vision:" << fixed << setprecision(2) << ballPositionCm;
 				serialPort.writeLine(payload.str());
@@ -607,7 +612,8 @@ int main(int argc, char* argv[])
 
 		//delay 30ms so that screen can refresh.
 		//image will not appear without this waitKey() command
-		waitKey(30);
+		int key = waitKey(30);
+		if (key == 27 || key == 'q') break;
 	}
 
 
