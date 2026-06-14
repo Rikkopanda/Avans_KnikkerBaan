@@ -146,6 +146,8 @@ class TelemetryBuffer:
         self.friction = collections.deque(maxlen=max_points)
         self.friction_blend = collections.deque(maxlen=max_points)
         self.beam_gain = collections.deque(maxlen=max_points)
+        self.curve_a = collections.deque(maxlen=max_points)
+        self.curve_exp = collections.deque(maxlen=max_points)
         self.cal_scale = collections.deque(maxlen=max_points)
         self.cal_offset = collections.deque(maxlen=max_points)
         self.ball_radius = collections.deque(maxlen=max_points)
@@ -164,7 +166,7 @@ class TelemetryBuffer:
         self.dist.append(fields.get("Dist", 0.0))
         self.distf.append(fields.get("DistF", 0.0))
         self.speed.append(fields.get("Speed", 0.0))
-        self.stuck_avg_speed.append(fields.get("StuckAvg", 0.0))
+        self.stuck_avg_speed.append(fields.get("Avg10Speed", fields.get("StuckAvg", 0.0)))
         self.accel.append(fields.get("Accel", 0.0))
         self.err.append(fields.get("Err", 0.0))
         self.integral.append(fields.get("Int", 0.0))
@@ -181,8 +183,8 @@ class TelemetryBuffer:
         self.travel.append(fields.get("Travel", 30.0))
         self.direction.append(fields.get("Dir", -1.0))
         self.pid_dead.append(fields.get("PidDead", 0.0))
-        self.settle_err.append(fields.get("SettleErr", 0.0))
-        self.settle_deriv.append(fields.get("SettleDeriv", 0.0))
+        self.settle_err.append(fields.get("SettleError", fields.get("SettleErr", 0.8)))
+        self.settle_deriv.append(fields.get("SettleSpeed", fields.get("SettleDeriv", 0.5)))
         self.servo_filt.append(fields.get("ServoFilt", 0.0))
         self.servo_rate.append(fields.get("ServoRate", 0.0))
         self.breakaway.append(fields.get("Breakaway", 0.0))
@@ -215,8 +217,10 @@ class TelemetryBuffer:
         self.friction.append(fields.get("Friction", 0.003))
         self.friction_blend.append(fields.get("FrictionBlend", 0.03))
         self.beam_gain.append(fields.get("BeamGain", 0.114))
-        self.cal_scale.append(fields.get("CalScale", 1.0))
-        self.cal_offset.append(fields.get("CalOffset", 0.0))
+        self.curve_a.append(fields.get("CurveA", 12.08))
+        self.curve_exp.append(fields.get("CurveExp", -1.058))
+        self.cal_scale.append(fields.get("CalScale", 1.333333))
+        self.cal_offset.append(fields.get("CalOffset", -3.333333))
         self.ball_radius.append(fields.get("BallRadius", 1.0))
         self.loopcount.append(fields.get("LoopCount", 0.0))
         self.adc_count.append(fields.get("ADC", 0.0))
@@ -329,7 +333,7 @@ def main() -> int:
     lines["dist"] = build_plot(axes[0], [], [], "Dist", "tab:blue")
     lines["distf"] = build_plot(axes[0], [], [], "DistF", "tab:cyan")
     lines["speed"] = build_plot(axes[0], [], [], "Speed", "tab:purple")
-    lines["stuck_avg_speed"] = build_plot(axes[0], [], [], "StaticAvg", "tab:red", 1.4)
+    lines["stuck_avg_speed"] = build_plot(axes[0], [], [], "Avg10Speed", "tab:red", 1.4)
     lines["accel"] = build_plot(axes[0], [], [], "Accel", "tab:green")
     lines["set"] = build_plot(axes[0], [], [], "Setpoint", "tab:orange", 1.2)
     axes[0].set_ylabel("cm")
@@ -381,7 +385,7 @@ def main() -> int:
     if not args.no_controls:
         # Parameter metadata: unit and explanation
         param_info = {
-            "setpoint": ("cm", "Desired ball distance from sensor. Target setpoint for control."),
+            "setpoint": ("cm", "Desired ball-center distance from sensor. Positive error means the ball is too far right/away."),
             "kp": ("gain", "Proportional gain. Higher = faster response to distance error."),
             "ki": ("gain", "Integral gain. Eliminates steady-state error over time."),
             "kd": ("gain", "Derivative gain. Dampens oscillations and smooths response."),
@@ -402,36 +406,44 @@ def main() -> int:
             "friction": ("N", "Estimated rolling/static friction force opposing commanded motion."),
             "frictionblend": ("m/s²", "Softens friction compensation around zero acceleration to prevent chatter."),
             "beamgain": ("ratio", "Beam angle divided by servo angle. Geometry estimate is about 0.114."),
-            "calscale": ("ratio", "Distance calibration scale."),
-            "caloffset": ("cm", "Distance calibration offset."),
+            "curvea": ("coefficient", "GP2Y0A41SK0F curve coefficient in distance = A × voltage^exponent."),
+            "curveexp": ("exponent", "GP2Y0A41SK0F voltage-to-distance curve exponent."),
+            "calscale": ("ratio", "Beam-scale correction applied to the full ball-center distance."),
+            "caloffset": ("cm", "Beam-scale offset applied after CalScale."),
             "ballradius": ("cm", "Added sensor-to-surface correction so control uses the ball center."),
+            "settleerror": ("cm", "10-sample deadband error threshold. Default 0.8 cm equals the requested 8 mm target."),
+            "settlespeed": ("cm/s", "10-sample average-speed threshold used with SettleError."),
         }
 
         slider_specs = [
             ("setpoint", "Set", 0.0, 30.0, 16.0, 0.1, "%.2f", "set"),
-            ("kp", "Kp", 0.0, 20.0, 2.2, 0.05, "%.2f", "kp"),
-            ("ki", "Ki", 0.0, 10.0, 0.35, 0.01, "%.2f", "ki"),
-            ("kd", "Kd", 0.0, 10.0, 1.2, 0.05, "%.2f", "kd"),
+            ("kp", "Kp", 0.0, 20.0, 3.0, 0.05, "%.2f", "kp"),
+            ("ki", "Ki", 0.0, 10.0, 0.15, 0.01, "%.2f", "ki"),
+            ("kd", "Kd", 0.0, 10.0, 3.5, 0.05, "%.2f", "kd"),
             ("servo", "Angle", 54.0, 114.0, 84.0, 0.1, "%.1f", "angle"),
             ("neutral", "Neutral", 0.0, 180.0, 84.0, 0.1, "%.1f", "neutral"),
             ("travel", "Travel", 1.0, 60.0, 25.0, 0.5, "%.1f", "travel"),
             ("dir", "Dir", -1.0, 1.0, -1.0, 2.0, "%.0f", "dir"),
-            ("distalpha", "DistAlpha", 0.01, 1.0, 0.25, 0.01, "%.2f", "distalpha"),
-            ("speedalpha", "SpeedAlpha", 0.01, 1.0, 0.18, 0.01, "%.2f", "speedalpha"),
+            ("distalpha", "DistAlpha", 0.01, 1.0, 0.35, 0.01, "%.2f", "distalpha"),
+            ("speedalpha", "SpeedAlpha", 0.01, 1.0, 0.15, 0.01, "%.2f", "speedalpha"),
             ("intlimit", "IntLimit", 0.0, 50.0, 12.0, 0.5, "%.1f", "intlimit"),
             ("maxaccel", "MaxAccel", 0.05, 5.0, 1.5, 0.05, "%.2f", "maxaccel"),
-            ("servorate", "SrvRate", 0.01, 10.0, 1.2, 0.01, "%.2f", "servorate"),
+            ("servorate", "SrvRate", 0.01, 10.0, 1.5, 0.01, "%.2f", "servorate"),
             ("servodead", "SrvDead", 0.0, 2.0, 0.02, 0.01, "%.2f", "servodead"),
             ("samplems", "SampleMs", 0.25, 20.0, 1.0, 0.25, "%.2f", "samplems"),
             ("mass", "Mass", 0.001, 0.5, 0.0455, 0.001, "%.3f", "mass"),
             ("gravity", "Gravity", 1.0, 15.0, 9.81, 0.01, "%.2f", "gravity"),
             ("rollfactor", "RollFactor", 1.0, 3.0, 1.4, 0.05, "%.2f", "rollfactor"),
-            ("friction", "Friction", 0.0, 0.1, 0.003, 0.0005, "%.4f", "friction"),
-            ("frictionblend", "FricBlend", 0.001, 0.5, 0.03, 0.005, "%.3f", "frictionblend"),
+            ("friction", "Friction", 0.0, 0.1, 0.0015, 0.0005, "%.4f", "friction"),
+            ("frictionblend", "FricBlend", 0.001, 0.5, 0.08, 0.005, "%.3f", "frictionblend"),
             ("beamgain", "BeamGain", 0.01, 0.5, 0.114, 0.001, "%.3f", "beamgain"),
-            ("calscale", "CalScale", 0.5, 1.5, 1.01695, 0.001, "%.3f", "calscale"),
-            ("caloffset", "CalOffset", -10.0, 10.0, -1.492, 0.01, "%.2f", "caloffset"),
-            ("ballradius", "BallRadius", 0.0, 3.0, 1.0, 0.05, "%.2f", "ballradius"),
+            ("curvea", "CurveA", 5.0, 20.0, 12.08, 0.01, "%.2f", "curvea"),
+            ("curveexp", "CurveExp", -2.0, -0.5, -1.058, 0.001, "%.3f", "curveexp"),
+            ("calscale", "CalScale", 0.5, 1.5, 1.333333, 0.001, "%.3f", "calscale"),
+            ("caloffset", "CalOffset", -10.0, 10.0, -3.333333, 0.01, "%.2f", "caloffset"),
+            ("ballradius", "BallRadius", 0.0, 3.0, 0.75, 0.05, "%.2f", "ballradius"),
+            ("settleerror", "SettleErr", 0.0, 3.0, 0.8, 0.05, "%.2f", "settleerror"),
+            ("settlespeed", "SettleSpeed", 0.0, 5.0, 0.5, 0.05, "%.2f", "settlespeed"),
         ]
 
         slider_axes = {}
@@ -763,9 +775,13 @@ def main() -> int:
         sliders["friction"].on_changed(lambda value: send_from_slider("friction", value, "{:.5f}"))
         sliders["frictionblend"].on_changed(lambda value: send_from_slider("frictionblend", value, "{:.3f}"))
         sliders["beamgain"].on_changed(lambda value: send_from_slider("beamgain", value, "{:.4f}"))
+        sliders["curvea"].on_changed(lambda value: send_from_slider("curvea", value, "{:.4f}"))
+        sliders["curveexp"].on_changed(lambda value: send_from_slider("curveexp", value, "{:.4f}"))
         sliders["calscale"].on_changed(lambda value: send_from_slider("calscale", value, "{:.5f}"))
         sliders["caloffset"].on_changed(lambda value: send_from_slider("caloffset", value, "{:.3f}"))
         sliders["ballradius"].on_changed(lambda value: send_from_slider("ballradius", value, "{:.2f}"))
+        sliders["settleerror"].on_changed(lambda value: send_from_slider("settleerror", value, "{:.2f}"))
+        sliders["settlespeed"].on_changed(lambda value: send_from_slider("settlespeed", value, "{:.2f}"))
 
         def toggle_controls(_event):
             new_state = not controls_visible["value"]
@@ -959,9 +975,13 @@ def main() -> int:
                     sliders["friction"].set_val(buf.friction[-1])
                     sliders["frictionblend"].set_val(buf.friction_blend[-1])
                     sliders["beamgain"].set_val(buf.beam_gain[-1])
+                    sliders["curvea"].set_val(buf.curve_a[-1])
+                    sliders["curveexp"].set_val(buf.curve_exp[-1])
                     sliders["calscale"].set_val(buf.cal_scale[-1])
                     sliders["caloffset"].set_val(buf.cal_offset[-1])
                     sliders["ballradius"].set_val(buf.ball_radius[-1])
+                    sliders["settleerror"].set_val(buf.settle_err[-1])
+                    sliders["settlespeed"].set_val(buf.settle_deriv[-1])
                 finally:
                     slider_guard["enabled"] = True
 

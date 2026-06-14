@@ -13,32 +13,38 @@ constexpr int DISPLAY_CS = 5;
 
 constexpr unsigned long CONTROL_US = 20000; // 50 Hz
 constexpr unsigned long TELEMETRY_MS = 200;
-constexpr int ADC_BUFFER_SIZE = 100;
+constexpr int ADC_BUFFER_SIZE = 31; // 15.5 ms window at the default 0.5 ms sample rate
 
 // Every value below influences control and can be changed from the GUI.
 double setpoint = 16.0;       // cm, ball center
-double Kp = 2.2;              // (m/s^2) / m
-double Ki = 0.5;              // (m/s^2) / (m s)
-double Kd = 1.5;              // (m/s^2) / (m/s)
+double Kp = 3.0;              // (m/s^2) / m
+double Ki = 0.15;             // (m/s^2) / (m s)
+double Kd = 3.5;              // (m/s^2) / (m/s)
 double servoNeutral = 84.0;   // degrees
 double servoTravel = 35.0;    // degrees either side of neutral
 double controlDirection = -1.0;
-double distanceAlpha = 0.25;  // new-sample weight, 0..1
-double speedAlpha = 0.18;     // new-sample weight, 0..1
+double distanceAlpha = 0.35;  // new-sample weight, 0..1
+double speedAlpha = 0.15;     // new-sample weight, 0..1
 double integralLimit = 12.0;  // cm s
 double maxAcceleration = 1.5; // m/s^2
-double servoRate = 8.2;       // degrees per 20 ms
+double servoRate = 1.5;       // degrees per 20 ms
 double servoDeadband = 0.01;  // minimum PWM update in degrees
 double sensorSampleMs = 0.5;  // continuous ADC sample interval
 double ballMassKg = 0.0455;
 double gravityMps2 = 9.81;
 double rollingFactor = 1.4;   // 1 + I/(m*r^2), solid sphere = 1.4
-double frictionForceN = 0.003;
-double frictionBlendMps2 = 0.03;
+double frictionForceN = 0.0015;
+double frictionBlendMps2 = 0.08;
 double beamPerServo = 0.114;  // beam angle / servo angle
-double calibrationScale = 1.0169491525;
-double calibrationOffset = -2.5715254237;
+double sensorCurveA = 12.08;  // GP2Y0A41SK0F: distance = A * voltage^exponent
+double sensorCurveExponent = -1.058;
+// Beam-scale calibration: sensor 10.0 cm -> beam 10.0 cm,
+// sensor 14.5 cm -> beam 16.0 cm.
+double calibrationScale = 1.3333333333;
+double calibrationOffset = -3.3333333333;
 double ballRadiusCm = 0.75;
+double settleErrorCm = 0.8;
+double settleAverageSpeedCmS = 0.5;
 
 enum InputSource { SENSOR, VISION };
 InputSource inputSource = SENSOR;
@@ -48,6 +54,7 @@ double visionPosition = -1.0;
 unsigned long lastVisionMs = 0;
 
 double rawDistance = -1.0;
+double measuredPosition = -1.0;
 double position = -1.0;
 double previousPosition = -1.0;
 double speed = 0.0;
@@ -60,6 +67,10 @@ double pidOutput = 0.0;
 double desiredAcceleration = 0.0;
 double desiredBeamAngle = 0.0;
 double requiredForceN = 0.0;
+double avarage10speed = 0.0;
+double averageSpeed10 = 0.0;
+int avaragecnt = 0;
+bool settleActive = false;
 double servoAngle = 84.0;
 double writtenServoAngle = 84.0;
 int sensorRaw = 0;
@@ -130,14 +141,7 @@ void sampleSensor()
   if ((unsigned long)(nowUs - lastSensorSampleUs) < intervalUs) return;
   // unsigned long dt = nowUs - lastSensorSampleUs;
   lastSensorSampleUs = nowUs;
-  adcBuffer[adcIndex] = analogRead(DISTANCE_PIN);
-  // if (adcIndex > 0)
-  // {
-  //   unsigned long diff = adcBuffer[adcIndex] - adcBuffer[adcIndex - 1];
-  //   speed
-  // }
-
-  
+  adcBuffer[adcIndex] = analogReadMilliVolts(DISTANCE_PIN);
   adcIndex = (adcIndex + 1) % ADC_BUFFER_SIZE;
   if (adcCount < ADC_BUFFER_SIZE) ++adcCount;
 }
@@ -163,15 +167,19 @@ int medianAdc()
 double readPosition()
 {
   if (inputSource == VISION) {
-    return (millis() - lastVisionMs <= 500) ? visionPosition : -1.0;
+    measuredPosition = (millis() - lastVisionMs <= 500) ? visionPosition : -1.0;
+    return measuredPosition;
   }
 
-  sensorRaw = medianAdc();
-  voltage = sensorRaw * 3.3 / 4095.0;
-  if (voltage <= 0.10) return -1.0;
+  sensorRaw = medianAdc(); // calibrated millivolts
+  voltage = sensorRaw / 1000.0;
+  if (voltage <= 0.0) return -1.0;
 
-  rawDistance = 13.0 / voltage;
-  return clampValue(calibrationScale * rawDistance + calibrationOffset + ballRadiusCm, 4.0, 30.0);
+  rawDistance = sensorCurveA * pow(voltage, sensorCurveExponent);
+  if (rawDistance < 4.0 || rawDistance > 30.0) return -1.0;
+  double ballCenterDistance = rawDistance + ballRadiusCm;
+  measuredPosition = calibrationScale * ballCenterDistance + calibrationOffset;
+  return measuredPosition;
 }
 
 void resetController()
@@ -179,6 +187,10 @@ void resetController()
   integral = 0.0;
   speed = 0.0;
   previousPosition = -1.0;
+  avarage10speed = 0.0;
+  averageSpeed10 = 0.0;
+  avaragecnt = 0;
+  settleActive = false;
 }
 
 struct Parameter {
@@ -210,9 +222,13 @@ Parameter parameters[] = {
   {"friction", &frictionForceN, 0.0, 1.0},
   {"frictionblend", &frictionBlendMps2, 0.001, 1.0},
   {"beamgain", &beamPerServo, 0.001, 1.0},
+  {"curvea", &sensorCurveA, 1.0, 30.0},
+  {"curveexp", &sensorCurveExponent, -3.0, -0.1},
   {"calscale", &calibrationScale, 0.1, 3.0},
   {"caloffset", &calibrationOffset, -20.0, 20.0},
   {"ballradius", &ballRadiusCm, 0.0, 5.0},
+  {"settleerror", &settleErrorCm, 0.0, 5.0},
+  {"settlespeed", &settleAverageSpeedCmS, 0.0, 10.0},
 };
 
 void handleCommand()
@@ -264,12 +280,11 @@ void handleCommand()
     if (name == parameter.name) {
       *parameter.value = clampValue(textValue.toFloat(), parameter.minimum, parameter.maximum);
       if (name == "dir") controlDirection = controlDirection >= 0.0 ? 1.0 : -1.0;
+      if (name == "set" || name == "setpoint") resetController();
       return;
     }
   }
 }
-double avarage10speed = 0;
-int avaragecnt = 0;
 void updateControl(double dt)
 {
   double measured = readPosition();
@@ -283,40 +298,56 @@ void updateControl(double dt)
   previousPosition = position;
   speed += speedAlpha * (measuredSpeed - speed);
 
-  error = setpoint - position;
-  // integral = clampValue(integral + error * dt, -integralLimit, integralLimit);
-  integral = integral + error * dt;
-  // PID requests ball acceleration. Position and speed are converted cm -> m.
-  pTerm = Kp * (error / 100.0);
-  iTerm = Ki * (integral / 100.0);
+  // Positive error means the ball is too far right/away from the sensor.
+  error = position - setpoint;
+
+  // Preserve the original 10-sample average-speed deadband logic.
+  avarage10speed += speed;
+  ++avaragecnt;
+  if (avaragecnt == 10) {
+    averageSpeed10 = avarage10speed / 10.0;
+    settleActive = fabs(error) < settleErrorCm &&
+                   fabs(averageSpeed10) < settleAverageSpeedCmS;
+    avarage10speed = 0.0;
+    avaragecnt = 0;
+
+    if (settleActive) {
+      // Stop applying the previous tilted command while settled.
+      servoAngle += clampValue(servoNeutral - servoAngle, -servoRate, servoRate);
+      if (fabs(servoAngle - writtenServoAngle) >= servoDeadband) {
+        writtenServoAngle = servoAngle;
+        writeServo(servoAngle);
+      }
+      showDistance(position);
+      return;
+    }
+  } else if (settleActive) {
+    servoAngle += clampValue(servoNeutral - servoAngle, -servoRate, servoRate);
+    if (fabs(servoAngle - writtenServoAngle) >= servoDeadband) {
+      writtenServoAngle = servoAngle;
+      writeServo(servoAngle);
+    }
+    showDistance(position);
+    return;
+  }
+
+  if ((error > 0 && integral < 0) || (error < 0 && integral > 0))
+  {
+    integral = 0;
+  }
+  integral = clampValue(integral + error * dt, -integralLimit, integralLimit);
+
+  // Positive acceleration increases sensor distance. Therefore positive error
+  // requests negative acceleration, back toward the sensor.
+  pTerm = -Kp * (error / 100.0);
   dTerm = -Kd * (speed / 100.0);
+  // if (fabs(dTerm) > 0.01)
+    // iTerm = 0;
+  // else
+    iTerm = -Ki * (integral / 100.0);
   desiredAcceleration = clampValue(pTerm + iTerm + dTerm,
                                    -maxAcceleration, maxAcceleration);
   pidOutput = desiredAcceleration;
-  avaragecnt++;
-  avarage10speed += speed;
-  Serial.printf("speed %f & %d & error %f\n", speed, avaragecnt, error);
-
-  
-
-  if (avaragecnt == 10)
-  {
-    avarage10speed = avarage10speed / 10;
-    Serial.printf("avarage %f\n", avarage10speed);
-    if (fabs(error) < 0.8 && fabs(avarage10speed) < 0.3)
-    {
-      // writeServo(servoNeutral);
-      Serial.printf("DEADBAND!\n");
-      avarage10speed = 0;
-      avaragecnt = 0;
-      return;
-    }
-    avarage10speed = 0;
-    avaragecnt = 0;
-      
-  }
-
-  
   // Inverse rolling-ball model:
   // m*g*sin(theta) = rollingFactor*m*a + frictionForce.
   // Smooth friction direction near zero prevents command sign chatter.
@@ -348,21 +379,23 @@ void updateControl(double dt)
 void sendTelemetry()
 {
   Serial.printf(
-      "Plot,Mode:%d,Src:%d,Set:%.3f,Raw:%d,Volt:%.3f,Dist:%.3f,DistF:%.3f,Speed:%.3f,Err:%.3f,Int:%.3f,Accel:%.4f,Out:%.3f,Servo:%.3f,POut:%.4f,IOut:%.4f,DOut:%.4f,Deriv:%.3f,Kp:%.3f,Ki:%.3f,Kd:%.3f,Neutral:%.2f,Travel:%.2f,Dir:%.0f,DistAlpha:%.3f,SpeedAlpha:%.3f,IntLimit:%.2f,MaxAccel:%.3f,ServoRate:%.3f,ServoDead:%.3f,SampleMs:%.2f,Mass:%.4f,Gravity:%.3f,RollFactor:%.3f,Friction:%.5f,FrictionBlend:%.3f,BeamGain:%.4f,Force:%.5f,CalScale:%.5f,CalOffset:%.3f,BallRadius:%.3f\n",
-      manualMode, inputSource == VISION, setpoint, sensorRaw, voltage, rawDistance,
-      position, speed, error, integral, desiredAcceleration, desiredBeamAngle,
+      "Plot,Mode:%d,Src:%d,Set:%.3f,Raw:%d,Volt:%.3f,Dist:%.3f,DistF:%.3f,Speed:%.3f,Avg10Speed:%.3f,Err:%.3f,Int:%.3f,Accel:%.4f,Out:%.3f,Servo:%.3f,POut:%.4f,IOut:%.4f,DOut:%.4f,Deriv:%.3f,Kp:%.3f,Ki:%.3f,Kd:%.3f,Neutral:%.2f,Travel:%.2f,Dir:%.0f,DistAlpha:%.3f,SpeedAlpha:%.3f,IntLimit:%.2f,MaxAccel:%.3f,ServoRate:%.3f,ServoDead:%.3f,SampleMs:%.2f,Mass:%.4f,Gravity:%.3f,RollFactor:%.3f,Friction:%.5f,FrictionBlend:%.3f,BeamGain:%.4f,Force:%.5f,CurveA:%.4f,CurveExp:%.4f,CalScale:%.5f,CalOffset:%.3f,BallRadius:%.3f,SettleError:%.3f,SettleSpeed:%.3f,Settle:%d\n",
+      manualMode, inputSource == VISION, setpoint, sensorRaw, voltage, measuredPosition,
+      position, speed, averageSpeed10, error, integral, desiredAcceleration, desiredBeamAngle,
       servoAngle, pTerm, iTerm, dTerm,
       -speed, Kp, Ki, Kd, servoNeutral, servoTravel, controlDirection,
       distanceAlpha, speedAlpha, integralLimit, maxAcceleration, servoRate,
       servoDeadband, sensorSampleMs, ballMassKg, gravityMps2, rollingFactor,
       frictionForceN, frictionBlendMps2, beamPerServo, requiredForceN,
-      calibrationScale, calibrationOffset, ballRadiusCm);
+      sensorCurveA, sensorCurveExponent, calibrationScale, calibrationOffset,
+      ballRadiusCm, settleErrorCm, settleAverageSpeedCmS, settleActive ? 1 : 0);
 }
 
 void setup()
 {
   Serial.begin(115200);
   Serial.setTimeout(5);
+  analogReadResolution(12);
   analogSetPinAttenuation(DISTANCE_PIN, ADC_11db);
   initDisplay();
   ledcSetup(SERVO_CHANNEL, SERVO_FREQ_HZ, SERVO_RES_BITS);
