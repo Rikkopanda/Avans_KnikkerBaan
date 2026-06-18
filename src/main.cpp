@@ -17,17 +17,17 @@ constexpr int ADC_BUFFER_SIZE = 31; // 15.5 ms window at the default 0.5 ms samp
 
 // Every value below influences control and can be changed from the GUI.
 double setpoint = 16.0;       // cm, ball center
-double Kp = 3.0;              // (m/s^2) / m
-double Ki = 0.15;             // (m/s^2) / (m s)
-double Kd = 3.5;              // (m/s^2) / (m/s)
+double Kp = 2;              // (m/s^2) / m
+double Ki = 0.35;             // (m/s^2) / (m s)
+double Kd = 1.2;              // (m/s^2) / (m/s)
 double servoNeutral = 84.0;   // degrees
 double servoTravel = 35.0;    // degrees either side of neutral
 double controlDirection = -1.0;
 double distanceAlpha = 0.35;  // new-sample weight, 0..1
-double speedAlpha = 0.15;     // new-sample weight, 0..1
-double integralLimit = 12.0;  // cm s
-double maxAcceleration = 1.5; // m/s^2
-double servoRate = 1.5;       // degrees per 20 ms
+double speedAlpha = 0.25;     // new-sample weight, 0..1
+double integralLimit = 35.0;  // cm s
+double maxAcceleration = 3.5; // m/s^2
+double servoRate = 3.5;       // degrees per 20 ms
 double servoDeadband = 0.01;  // minimum PWM update in degrees
 double sensorSampleMs = 0.5;  // continuous ADC sample interval
 double ballMassKg = 0.0455;

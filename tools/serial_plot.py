@@ -35,6 +35,64 @@ SERIAL_RE = re.compile(r"([A-Za-z]+):(-?\d+(?:\.\d+)?)")
 VISION_DEFAULT_LOW = (35, 80, 70)
 VISION_DEFAULT_HIGH = (90, 255, 255)
 
+BG = "#101418"
+PANEL_BG = "#161c22"
+CONTROL_BG = "#222a32"
+CONTROL_HOVER = "#2f3a44"
+GRID = "#3a4652"
+TEXT = "#e8edf2"
+MUTED = "#9aa7b2"
+ACCENT = "#4cc9f0"
+
+
+def use_dark_theme() -> None:
+    plt.rcParams.update({
+        "figure.facecolor": BG,
+        "axes.facecolor": PANEL_BG,
+        "axes.edgecolor": GRID,
+        "axes.labelcolor": TEXT,
+        "axes.titlecolor": TEXT,
+        "xtick.color": MUTED,
+        "ytick.color": MUTED,
+        "grid.color": GRID,
+        "legend.facecolor": CONTROL_BG,
+        "legend.edgecolor": GRID,
+        "legend.labelcolor": TEXT,
+        "text.color": TEXT,
+        "savefig.facecolor": BG,
+    })
+
+
+def style_axis(ax) -> None:
+    ax.set_facecolor(PANEL_BG)
+    for spine in ax.spines.values():
+        spine.set_color(GRID)
+    ax.tick_params(colors=MUTED)
+    ax.xaxis.label.set_color(TEXT)
+    ax.yaxis.label.set_color(TEXT)
+
+
+def style_button(button: Button) -> None:
+    button.ax.set_facecolor(CONTROL_BG)
+    button.color = CONTROL_BG
+    button.hovercolor = CONTROL_HOVER
+    button.label.set_color(TEXT)
+    for spine in button.ax.spines.values():
+        spine.set_edgecolor(GRID)
+
+
+def style_slider(slider: Slider) -> None:
+    slider.ax.set_facecolor(BG)
+    slider.label.set_color(TEXT)
+    slider.valtext.set_color(TEXT)
+    try:
+        slider.track.set_facecolor(CONTROL_BG)
+        slider.poly.set_facecolor(ACCENT)
+        slider.handle.set_facecolor(TEXT)
+        slider.handle.set_edgecolor(ACCENT)
+    except AttributeError:
+        pass
+
 
 def vision_available() -> bool:
     return cv2 is not None and np is not None
@@ -276,6 +334,8 @@ def apply_limits(ax, limits: Sequence[float] | None) -> None:
 
 
 def main() -> int:
+    use_dark_theme()
+
     parser = argparse.ArgumentParser(description="Live plot ESP32 serial telemetry")
     parser.add_argument("port", help="Serial port, for example /dev/ttyUSB0")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
@@ -320,11 +380,14 @@ def main() -> int:
     buf = TelemetryBuffer(args.points)
 
     fig, axes = plt.subplots(4, 1, sharex=True, figsize=(11, 9))
+    fig.patch.set_facecolor(BG)
     fig.canvas.manager.set_window_title("ESP32 Telemetry Plot")
     plot_bottom = 0.42 if not args.no_controls else 0.08
     plot_top = 0.93
     fig.subplots_adjust(bottom=plot_bottom, top=plot_top)
     fig.suptitle("ESP32 ball-balance telemetry")
+    for ax in axes:
+        style_axis(ax)
 
     # Track which subplot is enlarged (None = all visible)
     enlarged_axis = [None]
@@ -374,9 +437,9 @@ def main() -> int:
     status = fig.text(0.01, 0.015, f"Port: {args.port}", fontsize=9)
     gains_text = fig.text(0.50, 0.015, "Set: -- | Kp: -- | Ki: -- | Kd: -- | Servo: --", fontsize=9, ha="center")
     loopcount_text = fig.text(0.99, 0.015, "Loop: -- | ADC: -- | Ctrl: --", fontsize=9, ha="right")
-    help_text = fig.text(0.01, 0.96, 
-        "Click chart to enlarge  •  Scroll wheel to zoom  •  ↑↓ to pan  •  +/- to zoom when enlarged  •  R to reset", 
-        fontsize=8, style="italic", color="darkgray")
+    help_text = fig.text(0.01, 0.96,
+        "Click chart to enlarge  •  Scroll wheel to zoom  •  ↑↓ to pan  •  +/- to zoom when enlarged  •  R to reset",
+        fontsize=8, style="italic", color=MUTED)
 
     sliders = {}
     slider_guard = {"enabled": True}
@@ -469,15 +532,18 @@ def main() -> int:
             
             # Create a simple info window using matplotlib text
             info_window = plt.figure(figsize=(6, 3))
+            info_window.patch.set_facecolor(BG)
             info_window.suptitle(f"Parameter Info: {key.upper()}", fontsize=12, fontweight="bold")
             
             ax = info_window.add_subplot(111)
+            ax.set_facecolor(BG)
             ax.axis("off")
             
             # Display unit and explanation
             info_text = f"Unit: {unit}\n\nExplanation:\n{explanation}"
-            ax.text(0.5, 0.5, info_text, ha="center", va="center", fontsize=11, 
-                   wrap=True, bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+            ax.text(0.5, 0.5, info_text, ha="center", va="center", fontsize=11,
+                   wrap=True, bbox=dict(boxstyle="round", facecolor=CONTROL_BG,
+                                        edgecolor=GRID, alpha=0.95))
             
             plt.tight_layout()
             plt.show(block=False)
@@ -489,6 +555,7 @@ def main() -> int:
             axis = fig.add_axes([cols[col], top_row - row * row_gap, width, height])
             slider_axes[key] = axis
             sliders[key] = Slider(axis, label, vmin, vmax, valinit=valinit, valstep=valstep, valfmt=valfmt)
+            style_slider(sliders[key])
             sliders[key].valtext.set_fontsize(9)
             
             info_x = cols[col] + width + info_gap
@@ -496,6 +563,7 @@ def main() -> int:
             info_axis = fig.add_axes([info_x, info_y, info_width, height])
             info_axes[key] = info_axis
             info_button = Button(info_axis, "?")
+            style_button(info_button)
             info_button.label.set_fontsize(10)
             info_button.on_clicked(lambda _event, param_key=key: create_info_popup(param_key))
             info_buttons[key] = info_button
@@ -531,6 +599,8 @@ def main() -> int:
             "reset": Button(button_axes["reset"], "RESET"),
             "all": Button(button_axes["all"], "ALL"),
         }
+        for button in buttons.values():
+            style_button(button)
 
         vision_state = {
             "enabled": False,
@@ -636,9 +706,11 @@ def main() -> int:
                 return
 
             overview_fig, overview_ax = plt.subplots(figsize=(14, 8))
+            overview_fig.patch.set_facecolor(BG)
             overview_fig.canvas.manager.set_window_title("ESP32 all-in-one telemetry")
             overview_fig.suptitle("ESP32 all-in-one telemetry")
             overview_fig.subplots_adjust(top=0.90, bottom=0.10, left=0.07, right=0.98)
+            style_axis(overview_ax)
 
             overview_lines = {}
             overview_lines["dist"] = build_plot(overview_ax, [], [], "Dist", "tab:blue")

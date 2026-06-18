@@ -17,6 +17,8 @@
 #include <string>
 #include <iostream>
 #include <iomanip>
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -27,12 +29,12 @@ using namespace std;
 #include <deque>
 //initial min and max HSV filter values.
 //these will be changed using trackbars
-int H_MIN = 0;
-int H_MAX = 179;
-int S_MIN = 0;
+int H_MIN = 63;
+int H_MAX = 83;
+int S_MIN = 73;
 int S_MAX = 255;
-int V_MIN = 0;
-int V_MAX = 255;
+int V_MIN = 110;
+int V_MAX = 211;
 //default capture width and height
 const int FRAME_WIDTH = 640;
 const int FRAME_HEIGHT = 480;
@@ -51,18 +53,22 @@ const string controlsWindowName = "Controls";
 
 double beamDistanceCm = 30.0;
 
-int SETPOINT_TRACKBAR = 160;
-double setpointCm = 16.0;
-int KP_TRACKBAR = 30;
-int KI_TRACKBAR = 150;
-int KD_TRACKBAR = 35;
+int SETPOINT_TRACKBAR = 193;
+double setpointCm = 19.3;
+int KP_TRACKBAR = 19;
+int KI_TRACKBAR = 139;
+int KD_TRACKBAR = 13;
 int SERVO_NEUTRAL_TRACKBAR = 84;
 int SERVO_TRAVEL_TRACKBAR = 35;
 int CONTROL_DIRECTION_TRACKBAR = 0;
-int SETTLE_ERROR_TRACKBAR = 80;
+int SETTLE_ERROR_TRACKBAR = 110;
 int SETTLE_DERIVATIVE_TRACKBAR = 50;
 int SERVO_RATE_TRACKBAR = 150;
 int SERVO_DEADBAND_TRACKBAR = 1;
+
+const int HUE_MAX = 179;
+const int SATURATION_MAX = 255;
+const int VALUE_MAX = 255;
 
 Point2f beamStart(-1.0f, -1.0f);
 Point2f beamEnd(-1.0f, -1.0f);
@@ -81,11 +87,13 @@ public:
 	{
 		fd_ = ::open(path.c_str(), O_RDWR | O_NOCTTY | O_SYNC | O_NONBLOCK);
 		if (fd_ < 0) {
+			lastError_ = std::strerror(errno);
 			return false;
 		}
 
 		struct termios tty{};
 		if (tcgetattr(fd_, &tty) != 0) {
+			lastError_ = std::strerror(errno);
 			close();
 			return false;
 		}
@@ -111,10 +119,12 @@ public:
 		tty.c_cflag &= ~CRTSCTS;
 
 		if (tcsetattr(fd_, TCSANOW, &tty) != 0) {
+			lastError_ = std::strerror(errno);
 			close();
 			return false;
 		}
 
+		lastError_.clear();
 		return true;
 	}
 
@@ -155,6 +165,7 @@ public:
 	}
 
 	bool isOpen() const { return fd_ >= 0; }
+	const string& lastError() const { return lastError_; }
 
 private:
 	void close()
@@ -167,6 +178,7 @@ private:
 
 	int fd_ = -1;
 	string readBuf_;
+	string lastError_;
 };
 
 SerialPort* activeSerialPort = nullptr;
@@ -208,69 +220,77 @@ void pushCurrentControlState()
 	sendSerialFloat("servodead", SERVO_DEADBAND_TRACKBAR / 100.0, 2);
 }
 
-void on_trackbar( int, void* )
-{//This function gets called whenever a
-	// trackbar position is changed
-
-
-
-
-
+void on_trackbar(int value, void* userData)
+{
+	if (userData != nullptr) {
+		*static_cast<int*>(userData) = value;
+	}
 }
 
-void on_setpoint_trackbar(int, void*)
+void on_setpoint_trackbar(int value, void*)
 {
+	SETPOINT_TRACKBAR = value;
 	setpointCm = SETPOINT_TRACKBAR / 10.0;
 	sendSerialFloat("set", setpointCm, 2);
 }
 
-void on_kp_trackbar(int, void*)
+void on_kp_trackbar(int value, void*)
 {
+	KP_TRACKBAR = value;
 	sendSerialFloat("kp", KP_TRACKBAR / 10.0, 2);
 }
 
-void on_ki_trackbar(int, void*)
+void on_ki_trackbar(int value, void*)
 {
+	KI_TRACKBAR = value;
 	sendSerialFloat("ki", KI_TRACKBAR / 1000.0, 3);
 }
 
-void on_kd_trackbar(int, void*)
+void on_kd_trackbar(int value, void*)
 {
+	KD_TRACKBAR = value;
 	sendSerialFloat("kd", KD_TRACKBAR / 10.0, 2);
 }
 
-void on_neutral_trackbar(int, void*)
+void on_neutral_trackbar(int value, void*)
 {
+	SERVO_NEUTRAL_TRACKBAR = value;
 	sendSerialFloat("neutral", SERVO_NEUTRAL_TRACKBAR, 1);
 }
 
-void on_travel_trackbar(int, void*)
+void on_travel_trackbar(int value, void*)
 {
+	SERVO_TRAVEL_TRACKBAR = value;
 	sendSerialFloat("travel", SERVO_TRAVEL_TRACKBAR, 1);
 }
 
-void on_dir_trackbar(int, void*)
+void on_dir_trackbar(int value, void*)
 {
+	CONTROL_DIRECTION_TRACKBAR = value;
 	sendSerialInt("dir", CONTROL_DIRECTION_TRACKBAR ? 1 : -1);
 }
 
-void on_settleerr_trackbar(int, void*)
+void on_settleerr_trackbar(int value, void*)
 {
+	SETTLE_ERROR_TRACKBAR = value;
 	sendSerialFloat("settleerror", SETTLE_ERROR_TRACKBAR / 100.0, 2);
 }
 
-void on_settlederiv_trackbar(int, void*)
+void on_settlederiv_trackbar(int value, void*)
 {
+	SETTLE_DERIVATIVE_TRACKBAR = value;
 	sendSerialFloat("settlespeed", SETTLE_DERIVATIVE_TRACKBAR / 100.0, 2);
 }
 
-void on_servorate_trackbar(int, void*)
+void on_servorate_trackbar(int value, void*)
 {
+	SERVO_RATE_TRACKBAR = value;
 	sendSerialFloat("servorate", SERVO_RATE_TRACKBAR / 100.0, 2);
 }
 
-void on_servodead_trackbar(int, void*)
+void on_servodead_trackbar(int value, void*)
 {
+	SERVO_DEADBAND_TRACKBAR = value;
 	sendSerialFloat("servodead", SERVO_DEADBAND_TRACKBAR / 100.0, 2);
 }
 
@@ -325,6 +345,15 @@ string intToString(int number){
 	ss << number;
 	return ss.str();
 }
+
+void addTrackbar(const string &name, const string &window, int &value, int maximum,
+                 TrackbarCallback callback, void *userData = nullptr)
+{
+	const int initialValue = value;
+	createTrackbar(name, window, nullptr, maximum, callback, userData);
+	setTrackbarPos(name, window, initialValue);
+}
+
 void createTrackbars(){
 	//create window for trackbars
 
@@ -336,23 +365,23 @@ void createTrackbars(){
 	//the max value the trackbar can move (eg. H_HIGH), 
 	//and the function that is called whenever the trackbar is moved(eg. on_trackbar)
 	//                                  ---->    ---->     ---->      
-    createTrackbar( "H_MIN", trackbarWindowName, &H_MIN, H_MAX, on_trackbar );
-    createTrackbar( "H_MAX", trackbarWindowName, &H_MAX, H_MAX, on_trackbar );
-    createTrackbar( "S_MIN", trackbarWindowName, &S_MIN, S_MAX, on_trackbar );
-    createTrackbar( "S_MAX", trackbarWindowName, &S_MAX, S_MAX, on_trackbar );
-    createTrackbar( "V_MIN", trackbarWindowName, &V_MIN, V_MAX, on_trackbar );
-    createTrackbar( "V_MAX", trackbarWindowName, &V_MAX, V_MAX, on_trackbar );
-	createTrackbar( "Setpoint cm", controlsWindowName, &SETPOINT_TRACKBAR, (int)(beamDistanceCm * 10.0), on_setpoint_trackbar );
-	createTrackbar( "Kp x0.1", controlsWindowName, &KP_TRACKBAR, 500, on_kp_trackbar );
-	createTrackbar( "Ki x0.001", controlsWindowName, &KI_TRACKBAR, 5000, on_ki_trackbar );
-	createTrackbar( "Kd x0.1", controlsWindowName, &KD_TRACKBAR, 200, on_kd_trackbar );
-	createTrackbar( "Neutral", controlsWindowName, &SERVO_NEUTRAL_TRACKBAR, 180, on_neutral_trackbar );
-	createTrackbar( "Travel", controlsWindowName, &SERVO_TRAVEL_TRACKBAR, 60, on_travel_trackbar );
-	createTrackbar( "Dir", controlsWindowName, &CONTROL_DIRECTION_TRACKBAR, 1, on_dir_trackbar );
-	createTrackbar( "SetErr x0.01", controlsWindowName, &SETTLE_ERROR_TRACKBAR, 200, on_settleerr_trackbar );
-	createTrackbar( "SetSpeed x0.01", controlsWindowName, &SETTLE_DERIVATIVE_TRACKBAR, 500, on_settlederiv_trackbar );
-	createTrackbar( "SrvRate x0.01", controlsWindowName, &SERVO_RATE_TRACKBAR, 500, on_servorate_trackbar );
-	createTrackbar( "SrvDead x0.01", controlsWindowName, &SERVO_DEADBAND_TRACKBAR, 500, on_servodead_trackbar );
+    addTrackbar("H_MIN", trackbarWindowName, H_MIN, HUE_MAX, on_trackbar, &H_MIN);
+    addTrackbar("H_MAX", trackbarWindowName, H_MAX, HUE_MAX, on_trackbar, &H_MAX);
+    addTrackbar("S_MIN", trackbarWindowName, S_MIN, SATURATION_MAX, on_trackbar, &S_MIN);
+    addTrackbar("S_MAX", trackbarWindowName, S_MAX, SATURATION_MAX, on_trackbar, &S_MAX);
+    addTrackbar("V_MIN", trackbarWindowName, V_MIN, VALUE_MAX, on_trackbar, &V_MIN);
+    addTrackbar("V_MAX", trackbarWindowName, V_MAX, VALUE_MAX, on_trackbar, &V_MAX);
+	addTrackbar("Setpoint cm", controlsWindowName, SETPOINT_TRACKBAR, (int)(beamDistanceCm * 10.0), on_setpoint_trackbar);
+	addTrackbar("Kp x0.1", controlsWindowName, KP_TRACKBAR, 500, on_kp_trackbar);
+	addTrackbar("Ki x0.001", controlsWindowName, KI_TRACKBAR, 5000, on_ki_trackbar);
+	addTrackbar("Kd x0.1", controlsWindowName, KD_TRACKBAR, 200, on_kd_trackbar);
+	addTrackbar("Neutral", controlsWindowName, SERVO_NEUTRAL_TRACKBAR, 180, on_neutral_trackbar);
+	addTrackbar("Travel", controlsWindowName, SERVO_TRAVEL_TRACKBAR, 60, on_travel_trackbar);
+	addTrackbar("Dir", controlsWindowName, CONTROL_DIRECTION_TRACKBAR, 1, on_dir_trackbar);
+	addTrackbar("SetErr x0.01", controlsWindowName, SETTLE_ERROR_TRACKBAR, 200, on_settleerr_trackbar);
+	addTrackbar("SetSpeed x0.01", controlsWindowName, SETTLE_DERIVATIVE_TRACKBAR, 500, on_settlederiv_trackbar);
+	addTrackbar("SrvRate x0.01", controlsWindowName, SERVO_RATE_TRACKBAR, 500, on_servorate_trackbar);
+	addTrackbar("SrvDead x0.01", controlsWindowName, SERVO_DEADBAND_TRACKBAR, 500, on_servodead_trackbar);
 
 
 }
@@ -470,7 +499,11 @@ int main(int argc, char* argv[])
 	SerialPort serialPort;
 	if (!serialPortPath.empty()) {
 		if (!serialPort.openPort(serialPortPath, serialBaud)) {
-			cerr << "Warning: could not open serial port " << serialPortPath << endl;
+			cerr << "Warning: could not open serial port " << serialPortPath;
+			if (!serialPort.lastError().empty()) {
+				cerr << ": " << serialPort.lastError();
+			}
+			cerr << endl;
 		}
 	}
 	activeSerialPort = &serialPort;
