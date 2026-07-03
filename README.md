@@ -6,6 +6,7 @@ De code staat vooral in:
 
 - `src/main.cpp`: firmware voor de ESP32.
 - `tools/serial_plot.py`: Python GUI voor live grafieken en tuning.
+- `tools/serial_plot/`: simpele Qt/C++ GUI voor setpoint, PID-sliders en een positiegrafiek.
 - `tools/track.cpp`: OpenCV camera-tracker als alternatief voor de afstandssensor.
 
 ## Componenten
@@ -49,45 +50,31 @@ monitor_port = /dev/ttyUSB0
 
 Op Linux kan de poort ook `/dev/ttyACM0` zijn.
 
-## GUI Starten
+### Qt/C++ Serial Plot GUI
 
-Installeer eerst de Python dependencies:
+In `tools/serial_plot/` staat een kleine Qt/C++ GUI. Deze leest dezelfde `Plot,` telemetrie van de ESP32, tekent setpoint en gemeten positie in een grafiek en stuurt slider-aanpassingen voor `set`, `kp`, `ki` en `kd` terug via serial.
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-Start daarna de live plot:
+Build en start:
 
 ```bash
-python3 tools/serial_plot.py /dev/ttyUSB0 --baud 115200
+cd tools/serial_plot
+make
+./run_serial_plot_gui.sh /dev/ttyUSB0 --baud 115200
 ```
 
-Gebruik eventueel `/dev/ttyACM0` als dat jouw poort is.
+Het programma bestaat uit een paar simpele delen:
 
-In de GUI zie je onder andere:
+- `main.cpp` start de Qt-app en geeft de seriele poort en baudrate door aan het hoofdvenster.
+- `mainWindow.cpp` maakt het venster, de grafiek, sliders en statusbalk aan.
+- Een `QTimer` roept elke 30 ms `readSerial()` aan om nieuwe data van de ESP32 te lezen.
+- Binnenkomende regels worden verzameld tot complete tekstregels. Alleen regels die beginnen met `Plot,` worden gebruikt.
+- `parsePlotLine()` splitst zo'n regel op in waarden zoals `Set`, `DistF`, `Err`, `Servo`, `Kp`, `Ki` en `Kd`.
+- `GraphWidget` bewaart de laatste metingen en tekent de oranje setpoint-lijn en blauwe actuele positie-lijn.
+- Als je een slider beweegt, stuurt `sliderChanged()` direct een commando terug naar de ESP32, bijvoorbeeld `kp:1.20`.
 
-- afstand, gefilterde afstand en setpoint;
-- snelheid, error en integraal;
-- PID-output en servohoek;
-- spanning van de afstandssensor;
-- sliders voor `Kp`, `Ki`, `Kd`, setpoint, servo-neutral, filters en calibratie.
+De GUI gebruikt dus dezelfde serial-verbinding in twee richtingen: telemetry van de ESP32 naar de laptop, en tuning-commando's van de laptop terug naar de ESP32.
 
-Belangrijke knoppen:
-
-- `AUTO`: laat de regelaar automatisch sturen.
-- `MANUAL`: zet servo aansturing in handmatige modus.
-- `RESET`: reset de controllerstatus.
-- `SENSOR` / `CV`: wisselt tussen afstandssensor en camera-input.
-- `ALL`: opent een extra overzicht met alle signalen.
-
-Je kunt ook een los commando sturen en afsluiten:
-
-```bash
-python3 tools/serial_plot.py /dev/ttyUSB0 --send "set:16"
-```
+Gebruik deze GUI vooral als lichte basisversie. Voor meer signalen en tuning-opties is `tools/serial_plot.py` uitgebreider.
 
 ## Hoe Het Werkt
 
