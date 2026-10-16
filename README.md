@@ -1,6 +1,8 @@
 # Avans KnikkerBaan
 
-Dit project bestuurt een knikkerbaan met een ESP32. De ESP32 leest de positie van de bal, rekent met een PID-regelaar uit welke kant de baan op moet kantelen en stuurt daarna een servo aan. Via de seriele poort stuurt de ESP32 live telemetrie terug, zodat je op je laptop kunt meekijken en instellingen kunt aanpassen.
+Dit project bestuurt een knikkerbaan met een ESP32. De ESP32 leest de positie van de bal, via vision camera of afstandssensor, rekent met een PID-regelaar uit welke kant de baan op moet kantelen en stuurt daarna een servo aan. Via de seriele poort stuurt de ESP32 live telemetrie terug, zodat je op je laptop kunt meekijken en instellingen kunt aanpassen.
+
+
 
 De code staat vooral in:
 
@@ -61,6 +63,14 @@ cd tools/serial_plot
 make
 ./run_serial_plot_gui.sh /dev/ttyUSB0 --baud 115200
 ```
+
+Video uitleg:
+
+
+
+
+Schematisch overzicht's poster:
+![Uploading poster1.jpg…]()
 
 Het programma bestaat uit een paar simpele delen:
 
