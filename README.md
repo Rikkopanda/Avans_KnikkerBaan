@@ -64,13 +64,21 @@ make
 ./run_serial_plot_gui.sh /dev/ttyUSB0 --baud 115200
 ```
 
-Video uitleg:
+Video:
 
+https://github.com/user-attachments/assets/4d5b9ae2-1288-4675-a3b0-fe26454e87bc
 
-
+https://github.com/user-attachments/assets/d1bc61eb-6dda-4837-be91-7793b4e4ac02
 
 Schematisch overzicht's poster:
-![Uploading poster1.jpg…]()
+
+<img width="1659" height="2213" alt="poster1" src="https://github.com/user-attachments/assets/610912c1-f6f6-4b42-97ae-6d5a1d2ecf48" />
+
+
+
+
+
+
 
 Het programma bestaat uit een paar simpele delen:
 
