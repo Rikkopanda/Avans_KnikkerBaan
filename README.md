@@ -2,6 +2,15 @@
 
 Dit project bestuurt een knikkerbaan met een ESP32. De ESP32 leest de positie van de bal, via vision camera of afstandssensor, rekent met een PID-regelaar uit welke kant de baan op moet kantelen en stuurt daarna een servo aan. Via de seriele poort stuurt de ESP32 live telemetrie terug, zodat je op je laptop kunt meekijken en instellingen kunt aanpassen.
 
+Video:
+
+https://github.com/user-attachments/assets/4d5b9ae2-1288-4675-a3b0-fe26454e87bc
+
+https://github.com/user-attachments/assets/d1bc61eb-6dda-4837-be91-7793b4e4ac02
+
+Schematisch overzicht's poster:
+
+<img width="1659" height="2213" alt="poster1" src="https://github.com/user-attachments/assets/610912c1-f6f6-4b42-97ae-6d5a1d2ecf48" />
 
 
 De code staat vooral in:
@@ -63,22 +72,6 @@ cd tools/serial_plot
 make
 ./run_serial_plot_gui.sh /dev/ttyUSB0 --baud 115200
 ```
-
-Video:
-
-https://github.com/user-attachments/assets/4d5b9ae2-1288-4675-a3b0-fe26454e87bc
-
-https://github.com/user-attachments/assets/d1bc61eb-6dda-4837-be91-7793b4e4ac02
-
-Schematisch overzicht's poster:
-
-<img width="1659" height="2213" alt="poster1" src="https://github.com/user-attachments/assets/610912c1-f6f6-4b42-97ae-6d5a1d2ecf48" />
-
-
-
-
-
-
 
 Het programma bestaat uit een paar simpele delen:
 
